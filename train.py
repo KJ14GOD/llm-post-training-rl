@@ -13,6 +13,25 @@ SYSTEM_PROMPT = (
     "Do not show reasoning or examples."
 )
 
+def reward(parsed_answer, ground_truth, raw_text, num_tokens):
+    score = 0.0
+    has_tags = raw_text.startswith(START_TAG) and raw_text.endswith(END_TAG)
+    body = raw_text[len(START_TAG):-len(END_TAG)].strip() if has_tags else ""
+    exact_format = has_tags and body.lstrip("-").isdigit()
+
+    if parsed_answer is None:
+        score -= 0.5
+    elif parsed_answer == ground_truth and exact_format:
+        score += 1.0
+    elif parsed_answer == ground_truth:
+        score += 0.5
+    else:
+        score -= 0.25
+
+    if parsed_answer == ground_truth and exact_format and num_tokens <= 10:
+        score += 0.05
+
+    return score
 
 def parse_answer(text):
     if text.startswith(START_TAG) and text.endswith(END_TAG):
@@ -44,27 +63,18 @@ def trim_to_final_response(text):
 
     return text.split(END_TAG, 1)[0] + END_TAG
 
-
-def get_level_name(index):
-    if index < 10:
-        return "Level 1: Basic Arithmetic"
-    if index < 20:
-        return "Level 2: Multi-Step Arithmetic"
-    return "Level 3: Word Problems"
-
 def smoke_test():
     # device = "mps" if torch.backends.mps.is_available() else "cpu" 
     correct = 0
-    answers = [
+    exact_format = 0
+    total_output_len = 0
+    level_correct = [0, 0, 0]
+    level_names = ["Level 1: Basic Arithmetic", "Level 2: Multi-Step", "Level 3: Word Problems"]
+    ground_truth = [
         45, 23, 504, 12, 86, 35, 391, 14, 83, 33,
         180, 138, 624, 108, 53, 245, 474, 90, 199, 280,
         180, 192, 41, 1728, 78, 84, 288, 432, 1620, 87,
     ]
-    level_stats = {
-        "Level 1: Basic Arithmetic": {"correct": 0, "total": 0},
-        "Level 2: Multi-Step Arithmetic": {"correct": 0, "total": 0},
-        "Level 3: Word Problems": {"correct": 0, "total": 0},
-    }
     device = "cpu"
     dtype = torch.float16 if device == "mps" else torch.float32
 
@@ -72,7 +82,7 @@ def smoke_test():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        dtype=dtype,
+        torch_dtype=dtype,
         attn_implementation="eager"
     )
     model.to(device)
@@ -114,11 +124,8 @@ def smoke_test():
         "A delivery truck carries 125 packages and delivers 38 of them. How many packages remain?"
     ]
 
-    assert len(prompt_questions) == len(answers)
-
-    for idx, (prompt_question, target_answer) in enumerate(zip(prompt_questions, answers)):
-        level_name = get_level_name(idx)
-        level_stats[level_name]["total"] += 1
+    # for prompt_question in prompt_questions:
+    for i, (prompt_question, ground_truth) in enumerate(zip(prompt_questions, ground_truth)):
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt_question},
@@ -132,37 +139,63 @@ def smoke_test():
         with torch.no_grad():
             output = model.generate(
                 **inputs,
-                max_new_tokens=512,
+                max_new_tokens=32,
                 do_sample=False, # deterministic generation
                 pad_token_id=tokenizer.eos_token_id,
             )
+        # get input and output lengths
         input_len = inputs["input_ids"].shape[1]
         output_len = output[0].shape[0]
+
+        # print input and output lengths
         print(f"QUESTION: {prompt_question}")
-        print(f"LEVEL: {level_name}")
         print(f"input length: {input_len}, output length: {output_len}")
+
+        # get only the newly generated tokens and decode them 
         new_tokens = output[0][input_len:]
         raw_new_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+        # trim to final response
         trimmed_new_text = trim_to_final_response(raw_new_text)
         final_text = trimmed_new_text if trimmed_new_text != raw_new_text else raw_new_text
+
+        # parse the answer
         parsed_answer = parse_answer(final_text)
+        new_token_count = output_len - input_len
+
+        # output length tracking and exact format tracking
+        total_output_len += new_token_count
+        has_tags = raw_new_text.startswith(START_TAG) and raw_new_text.endswith(END_TAG)
+        body = raw_new_text[len(START_TAG):-len(END_TAG)].strip() if has_tags else ""
+        is_exact = has_tags and body.lstrip("-").isdigit()
+
+        if is_exact:
+            exact_format += 1
+        
+        # reward tracking
+        reward_score = reward(parsed_answer, ground_truth, trimmed_new_text, new_token_count)
+
         print("NEW TEXT:")
         print(repr(final_text))
         print(f"PARSED ANSWER: {parsed_answer}")
-        print(f"GROUND TRUTH: {target_answer}")
-        if parsed_answer == target_answer:
+        print(f"GROUND TRUTH: {ground_truth}")
+        print(f"EXACT FORMAT: {is_exact} | OUTPUT TOKENS: {new_token_count}")
+        if (parsed_answer == ground_truth):
             print("CORRECT")
-            correct += 1
-            level_stats[level_name]["correct"] += 1
+            correct+=1
+            level_correct[i // 10] += 1
         else:
             print("INCORRECT")
+        print(f"REWARD SCORE: {reward_score}")
         print()
-    print(f"CORRECT: {correct}, INCORRECT: {len(prompt_questions) - correct}")
-    print(f"ACCURACY: {correct / len(prompt_questions)}")
-    print()
-    for level_name, stats in level_stats.items():
-        level_accuracy = stats["correct"] / stats["total"]
-        print(f"{level_name}: {stats['correct']}/{stats['total']} = {level_accuracy:.1%}")
+    print("=" * 40)
+    for lvl in range(3):
+        r = level_correct[lvl]
+        print(f"{level_names[lvl]}: {r}/10 right, {10 - r}/10 wrong")
+    print(f"TOTAL: {correct}/30 right, {30 - correct}/30 wrong")
+    print(f"ACCURACY: {correct / 30:.1%}")
+    print(f"EXACT FORMAT RATE: {exact_format}/30 ({exact_format / 30:.1%})")
+    print(f"AVG OUTPUT LENGTH: {total_output_len / 30:.1f} tokens")
 
     
 if __name__ == "__main__":
