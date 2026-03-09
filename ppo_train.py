@@ -1,6 +1,7 @@
 import re
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch.nn as nn
+from transformers import AutoTokenizer
 from lora import build_lora_model
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -12,6 +13,26 @@ SYSTEM_PROMPT = (
     "<final_response>INTEGER</final_response>. "
     "Do not show reasoning or examples."
 )
+
+
+class PolicyWithValueHead(nn.Module):
+    def __init__(self, policy_model):
+        super().__init__()
+        self.policy_model = policy_model
+        hidden_size = policy_model.config.hidden_size # get the hidden size from the policy model
+        # PPO uses this critic head to estimate expected reward from the final hidden states.
+        self.value_head = nn.Linear(hidden_size, 1) # a linear layer to map the hidden states to a scalar value
+
+    def forward(self, *args, **kwargs):
+        kwargs["output_hidden_states"] = True # output the hidden states
+        kwargs["return_dict"] = True # return a dictionary 
+        outputs = self.policy_model(*args, **kwargs) # get the outputs from the policy model
+        last_hidden_state = outputs.hidden_states[-1] 
+        values = self.value_head(last_hidden_state).squeeze(-1) # squeeze the last dimension to get a scalar value
+        return outputs, values # return the outputs and the values
+
+    def generate(self, *args, **kwargs):
+        return self.policy_model.generate(*args, **kwargs)
 
 def reward(parsed_answer, ground_truth, raw_text, num_tokens):
     score = 0.0
@@ -81,10 +102,9 @@ def smoke_test():
 
     print(f"loading {MODEL_ID} with LoRA adapters on {device}...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    lora_model = build_lora_model(MODEL_ID, device, dtype)
-
-    lora_model.to(device)
-    lora_model.eval()
+    lora_model = build_lora_model(MODEL_ID, dtype)
+    policy = PolicyWithValueHead(lora_model).to(device)
+    policy.eval()
 
     prompt_questions = [
         # Level 1: Basic Arithmetic
@@ -135,7 +155,7 @@ def smoke_test():
         )
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         with torch.no_grad():
-            output = lora_model.generate(
+            output = policy.generate(
                 **inputs,
                 max_new_tokens=32,
                 do_sample=False, # deterministic generation
@@ -160,6 +180,10 @@ def smoke_test():
         # parse the answer
         parsed_answer = parse_answer(final_text)
         new_token_count = output_len - input_len
+        full_attention_mask = torch.ones_like(output, device=device)
+        with torch.no_grad():
+            _, values = policy(input_ids=output, attention_mask=full_attention_mask)
+        final_value_estimate = values[0][-1].item()
 
         # output length tracking and exact format tracking
         total_output_len += new_token_count
@@ -179,6 +203,7 @@ def smoke_test():
         print(f"PARSED ANSWER: {parsed_answer}")
         print(f"GROUND TRUTH: {target_answer}")
         print(f"EXACT FORMAT: {is_exact} | OUTPUT TOKENS: {new_token_count}")
+        print(f"VALUE ESTIMATE: {final_value_estimate:.4f}")
         if (parsed_answer == target_answer):
             print("CORRECT")
             correct+=1
