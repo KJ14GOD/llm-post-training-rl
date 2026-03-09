@@ -1,0 +1,68 @@
+The LoRA roadmap is:
+
+Start from your pretrained Qwen base model.
+This is the backbone.
+Keep the original model weights frozen.
+Add LoRA adapters to a few transformer layers.
+Start with q_proj and v_proj.
+These adapters are the trainable part of the policy.
+Add a value head on top of the shared backbone.
+The LM head still predicts next-token logits.
+The value head predicts expected reward for PPO.
+Make a separate frozen reference model.
+Same original Qwen weights.
+No LoRA updates.
+Used for the KL penalty during PPO.
+So the architecture becomes:
+
+policy model = frozen Qwen backbone + trainable LoRA adapters + value head
+reference model = frozen original Qwen model
+Keep your verifier fixed.
+parser
+exact-format check
+reward function
+That reward becomes the scalar signal PPO trains against.
+
+Generate on-policy rollouts from the policy model.
+prompt goes in
+model samples response token by token
+verifier scores full response
+value head predicts expected reward along the way
+Compute PPO pieces.
+logprobs from policy model
+logprobs from reference model for KL penalty
+value predictions from value head
+reward from verifier
+advantage = reward minus predicted value
+Update only:
+LoRA adapter weights
+value head weights
+Do not update:
+
+frozen Qwen backbone
+reference model
+Evaluate against your current baseline using:
+accuracy
+exact-format rate
+average reward
+average output length
+Recommended minimal LoRA config:
+
+target modules: q_proj, v_proj
+rank r = 8
+alpha 16
+dropout 0.05
+Why this setup is clean:
+
+still real RL
+verifier is reward function
+PPO is the policy update
+LoRA just makes training cheap enough to run
+That is the roadmap in the correct order:
+freeze base, add LoRA, add value head, keep ref model frozen, run PPO with verifier reward, compare to baseline.
+
+
+q_proj = query 
+v_proj = what value u get 
+
+updating query and value values 

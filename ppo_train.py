@@ -1,7 +1,7 @@
 import re
-
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from lora import build_lora_model
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 START_TAG = "<final_response>"
@@ -66,6 +66,7 @@ def trim_to_final_response(text):
 def smoke_test():
     # device = "mps" if torch.backends.mps.is_available() else "cpu" 
     correct = 0
+    total_reward = 0.0
     exact_format = 0
     total_output_len = 0
     level_correct = [0, 0, 0]
@@ -78,15 +79,12 @@ def smoke_test():
     device = "cpu"
     dtype = torch.float16 if device == "mps" else torch.float32
 
-    print(f"loading {MODEL_ID} on {device}...")
+    print(f"loading {MODEL_ID} with LoRA adapters on {device}...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        torch_dtype=dtype,
-        attn_implementation="eager"
-    )
-    model.to(device)
-    model.eval()
+    lora_model = build_lora_model(MODEL_ID, device, dtype)
+
+    lora_model.to(device)
+    lora_model.eval()
 
     prompt_questions = [
         # Level 1: Basic Arithmetic
@@ -125,7 +123,7 @@ def smoke_test():
     ]
 
     # for prompt_question in prompt_questions:
-    for i, (prompt_question, ground_truth) in enumerate(zip(prompt_questions, ground_truth)):
+    for i, (prompt_question, target_answer) in enumerate(zip(prompt_questions, ground_truth)):
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt_question},
@@ -137,7 +135,7 @@ def smoke_test():
         )
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         with torch.no_grad():
-            output = model.generate(
+            output = lora_model.generate(
                 **inputs,
                 max_new_tokens=32,
                 do_sample=False, # deterministic generation
@@ -172,15 +170,16 @@ def smoke_test():
         if is_exact:
             exact_format += 1
         
+        
         # reward tracking
-        reward_score = reward(parsed_answer, ground_truth, trimmed_new_text, new_token_count)
-
+        reward_score = reward(parsed_answer, target_answer, trimmed_new_text, new_token_count)
+        total_reward += reward_score
         print("NEW TEXT:")
         print(repr(final_text))
         print(f"PARSED ANSWER: {parsed_answer}")
-        print(f"GROUND TRUTH: {ground_truth}")
+        print(f"GROUND TRUTH: {target_answer}")
         print(f"EXACT FORMAT: {is_exact} | OUTPUT TOKENS: {new_token_count}")
-        if (parsed_answer == ground_truth):
+        if (parsed_answer == target_answer):
             print("CORRECT")
             correct+=1
             level_correct[i // 10] += 1
@@ -195,8 +194,9 @@ def smoke_test():
     print(f"TOTAL: {correct}/30 right, {30 - correct}/30 wrong")
     print(f"ACCURACY: {correct / 30:.1%}")
     print(f"EXACT FORMAT RATE: {exact_format}/30 ({exact_format / 30:.1%})")
-    print(f"AVG OUTPUT LENGTH: {total_output_len / 30:.1f} tokens")
-
+    print(f"AVG OUTPUT LENGTH: {total_output_len / 30:.4f} tokens")
+    print(f"TOTAL REWARD: {total_reward}")
+    print(f"AVG REWARD: {total_reward / 30:.4f}")
     
 if __name__ == "__main__":
     smoke_test()
