@@ -1,8 +1,12 @@
-import re
+import random
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer
-from lora import build_lora_model
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from lora import build_lora_model, save_lora_adapters
+from data import PROMPT_QUESTIONS, GROUND_TRUTH, LEVEL_NAMES
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 START_TAG = "<final_response>"
@@ -14,25 +18,74 @@ SYSTEM_PROMPT = (
     "Do not show reasoning or examples."
 )
 
+SEED = 42
+NUM_EPOCHS = 50
+LEARNING_RATE = 5e-5
+CLIP_EPS = 0.2
+VALUE_COEF = 0.1
+KL_COEF = 0.01
+MAX_GRAD_NORM = 1.0
+SAMPLE_TEMPERATURE = 0.7
+ADAPTER_SAVE_PATH = "./lora_adapters"
+
+
+@dataclass
+class RolloutRecord:
+    prompt_question: str
+    target_answer: int
+    input_len: int
+    output_len: int
+    output_ids: torch.Tensor
+    generated_token_ids: torch.Tensor
+    final_text: str
+    parsed_answer: int | None
+    output_token_count: int
+    exact_format: bool
+    policy_logprobs: torch.Tensor
+    reference_logprobs: torch.Tensor
+    generated_values: torch.Tensor
+    final_value_estimate: float
+    reward_score: float
+    is_correct: bool
+
+
+@dataclass
+class PPOTargets:
+    old_policy_logprobs: torch.Tensor
+    reference_logprobs: torch.Tensor
+    generated_values: torch.Tensor
+    reward: float
+    returns: torch.Tensor
+    advantages: torch.Tensor
+    final_advantage: float
+    reference_kl_per_token: torch.Tensor
+    reference_kl_mean: float
+
 
 class PolicyWithValueHead(nn.Module):
     def __init__(self, policy_model):
         super().__init__()
         self.policy_model = policy_model
-        hidden_size = policy_model.config.hidden_size # get the hidden size from the policy model
-        # PPO uses this critic head to estimate expected reward from the final hidden states.
-        self.value_head = nn.Linear(hidden_size, 1) # a linear layer to map the hidden states to a scalar value
+        hidden_size = policy_model.config.hidden_size
+        self.value_head = nn.Linear(hidden_size, 1)
 
     def forward(self, *args, **kwargs):
-        kwargs["output_hidden_states"] = True # output the hidden states
-        kwargs["return_dict"] = True # return a dictionary 
-        outputs = self.policy_model(*args, **kwargs) # get the outputs from the policy model
-        last_hidden_state = outputs.hidden_states[-1] 
-        values = self.value_head(last_hidden_state).squeeze(-1) # squeeze the last dimension to get a scalar value
-        return outputs, values # return the outputs and the values
+        kwargs["output_hidden_states"] = True
+        kwargs["return_dict"] = True
+        outputs = self.policy_model(*args, **kwargs)
+        last_hidden_state = outputs.hidden_states[-1]
+        values = self.value_head(last_hidden_state).squeeze(-1)
+        return outputs, values
 
     def generate(self, *args, **kwargs):
         return self.policy_model.generate(*args, **kwargs)
+
+
+def gather_token_logprobs(logits, tokens):
+    log_probs = torch.log_softmax(logits, dim=-1)
+    token_log_probs = log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
+    return token_log_probs
+
 
 def reward(parsed_answer, ground_truth, raw_text, num_tokens):
     score = 0.0
@@ -54,19 +107,18 @@ def reward(parsed_answer, ground_truth, raw_text, num_tokens):
 
     return score
 
+
 def parse_answer(text):
     if text.startswith(START_TAG) and text.endswith(END_TAG):
         body = text[len(START_TAG):-len(END_TAG)].strip()
     else:
         body = text.strip()
 
-    # best case: just one integer
     try:
         return int(body)
     except ValueError:
         pass
 
-    # fallback: split by spaces, go backward, return first int found
     parts = body.split()
     for part in reversed(parts):
         cleaned = part.strip(".,!?()[]{}")
@@ -84,144 +136,348 @@ def trim_to_final_response(text):
 
     return text.split(END_TAG, 1)[0] + END_TAG
 
-def smoke_test():
-    # device = "mps" if torch.backends.mps.is_available() else "cpu" 
-    correct = 0
-    total_reward = 0.0
-    exact_format = 0
-    total_output_len = 0
-    level_correct = [0, 0, 0]
-    level_names = ["Level 1: Basic Arithmetic", "Level 2: Multi-Step", "Level 3: Word Problems"]
-    ground_truth = [
-        45, 23, 504, 12, 86, 35, 391, 14, 83, 33,
-        180, 138, 624, 108, 53, 245, 474, 90, 199, 280,
-        180, 192, 41, 1728, 78, 84, 288, 432, 1620, 87,
-    ]
-    device = "cpu"
-    dtype = torch.float16 if device == "mps" else torch.float32
 
-    print(f"loading {MODEL_ID} with LoRA adapters on {device}...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    lora_model = build_lora_model(MODEL_ID, dtype)
-    policy = PolicyWithValueHead(lora_model).to(device)
+def build_ppo_targets(rollout: RolloutRecord):
+    old_policy_logprobs = rollout.policy_logprobs
+    reference_logprobs = rollout.reference_logprobs
+    generated_values = rollout.generated_values
+
+    reward_tensor = torch.tensor(rollout.reward_score, dtype=generated_values.dtype)
+    returns = torch.full_like(generated_values, fill_value=reward_tensor.item())
+    advantages = returns - generated_values
+    final_advantage = rollout.reward_score - rollout.final_value_estimate
+
+    reference_kl_per_token = old_policy_logprobs - reference_logprobs
+    reference_kl_mean = reference_kl_per_token.mean().item()
+
+    return PPOTargets(
+        old_policy_logprobs=old_policy_logprobs,
+        reference_logprobs=reference_logprobs,
+        generated_values=generated_values,
+        reward=rollout.reward_score,
+        returns=returns,
+        advantages=advantages,
+        final_advantage=final_advantage,
+        reference_kl_per_token=reference_kl_per_token,
+        reference_kl_mean=reference_kl_mean,
+    )
+
+
+def recompute_policy_stats(policy, rollout: RolloutRecord, device):
+    output_ids = rollout.output_ids.unsqueeze(0).to(device)
+    attention_mask = torch.ones_like(output_ids, device=device)
+    policy_outputs, values = policy(input_ids=output_ids, attention_mask=attention_mask)
+
+    policy_logits = policy_outputs.logits[:, :-1, :]
+    target_tokens = output_ids[:, 1:]
+    policy_token_logprobs = gather_token_logprobs(policy_logits, target_tokens)
+
+    generated_policy_logprobs = policy_token_logprobs[:, rollout.input_len - 1:]
+    generated_values = values[:, rollout.input_len - 1:-1]
+    return generated_policy_logprobs[0], generated_values[0]
+
+
+def ppo_update(policy, optimizer, rollout_records, ppo_targets, device):
+    policy.train()
+
+    policy_losses = []
+    value_losses = []
+    kl_terms = []
+    total_losses = []
+
+    for rollout, targets in zip(rollout_records, ppo_targets):
+        new_policy_logprobs, new_values = recompute_policy_stats(policy, rollout, device)
+        old_policy_logprobs = targets.old_policy_logprobs.to(device)
+        reference_logprobs = targets.reference_logprobs.to(device)
+        advantages = targets.advantages.to(device)
+        returns = targets.returns.to(device)
+
+        ratios = torch.exp(new_policy_logprobs - old_policy_logprobs)
+        clipped_ratios = torch.clamp(ratios, 1 - CLIP_EPS, 1 + CLIP_EPS)
+
+        unclipped_objective = ratios * advantages
+        clipped_objective = clipped_ratios * advantages
+        policy_loss = -torch.min(unclipped_objective, clipped_objective).mean()
+        value_loss = F.mse_loss(new_values, returns)
+        reference_kl = (new_policy_logprobs - reference_logprobs).mean()
+
+        total_loss = policy_loss + (VALUE_COEF * value_loss) + (KL_COEF * reference_kl)
+
+        policy_losses.append(policy_loss)
+        value_losses.append(value_loss)
+        kl_terms.append(reference_kl)
+        total_losses.append(total_loss)
+
+    mean_policy_loss = torch.stack(policy_losses).mean()
+    mean_value_loss = torch.stack(value_losses).mean()
+    mean_reference_kl = torch.stack(kl_terms).mean()
+    mean_total_loss = torch.stack(total_losses).mean()
+
+    optimizer.zero_grad()
+    mean_total_loss.backward()
+    torch.nn.utils.clip_grad_norm_(
+        [p for p in policy.parameters() if p.requires_grad],
+        MAX_GRAD_NORM,
+    )
+    optimizer.step()
     policy.eval()
 
-    prompt_questions = [
-        # Level 1: Basic Arithmetic
-        "What is 17 + 28?",
-        "What is 42 - 19?",
-        "What is 36 * 14?",
-        "What is 144 / 12?",
-        "What is 29 + 57?",
-        "What is 81 - 46?",
-        "What is 23 * 17?",
-        "What is 196 / 14?",
-        "What is 45 + 38?",
-        "What is 72 - 39?",
-        # Level 2: Multi-Step Arithmetic
-        "What is (17 + 28) * 4?",
-        "What is (42 - 19) * 6?",
-        "What is (36 * 14) + 120?",
-        "What is (144 / 12) * 9?",
-        "What is (29 + 57) - 33?",
-        "What is (81 - 46) * 7?",
-        "What is (23 * 17) + (45 + 38)?",
-        "What is (196 / 14) * 5 + 20?",
-        "What is (45 + 38) * 3 - 50?",
-        "What is (72 - 39) * 8 + 16?",
-        # Level 3: Word Problems
-        "A train travels 60 miles per hour for 3 hours. How far does it travel?",
-        "A box contains 24 packs of pencils and each pack has 8 pencils. How many pencils are there in total?",
-        "Sarah buys 5 notebooks for 7 dollars each and 3 pens for 2 dollars each. What is the total cost in dollars?",
-        "A warehouse stores 48 boxes and each box contains 36 items. How many items are stored in total?",
-        "A farmer has 125 apples and sells 47 of them. How many apples remain?",
-        "A classroom has 28 students and each student receives 3 books. How many books are distributed in total?",
-        "A car travels 72 miles per hour for 4 hours. How far does it travel?",
-        "A store sells 18 boxes of cookies and each box contains 24 cookies. How many cookies were sold?",
-        "A school buys 36 desks and each desk costs 45 dollars. What is the total cost in dollars?",
-        "A delivery truck carries 125 packages and delivers 38 of them. How many packages remain?"
-    ]
+    return {
+        "policy_loss": mean_policy_loss.item(),
+        "value_loss": mean_value_loss.item(),
+        "reference_kl": mean_reference_kl.item(),
+        "total_loss": mean_total_loss.item(),
+    }
 
-    # for prompt_question in prompt_questions:
-    for i, (prompt_question, target_answer) in enumerate(zip(prompt_questions, ground_truth)):
+
+def collect_rollout_record(policy, reference_model, tokenizer, prompt_question, target_answer, device, do_sample=True):
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": prompt_question},
+    ]
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+    generate_kwargs = dict(
+        **inputs,
+        max_new_tokens=32,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    if do_sample:
+        generate_kwargs["do_sample"] = True
+        generate_kwargs["temperature"] = SAMPLE_TEMPERATURE
+    else:
+        generate_kwargs["do_sample"] = False
+
+    with torch.no_grad():
+        output = policy.generate(**generate_kwargs)
+
+    input_len = inputs["input_ids"].shape[1]
+    output_len = output[0].shape[0]
+    new_tokens = output[0][input_len:]
+    raw_new_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    trimmed_new_text = trim_to_final_response(raw_new_text)
+    final_text = trimmed_new_text if trimmed_new_text != raw_new_text else raw_new_text
+    parsed_answer = parse_answer(final_text)
+    output_token_count = output_len - input_len
+
+    full_attention_mask = torch.ones_like(output, device=device)
+    with torch.no_grad():
+        policy_outputs, values = policy(input_ids=output, attention_mask=full_attention_mask)
+        reference_outputs = reference_model(
+            input_ids=output,
+            attention_mask=full_attention_mask,
+            return_dict=True,
+        )
+
+    policy_logits = policy_outputs.logits[:, :-1, :]
+    reference_logits = reference_outputs.logits[:, :-1, :]
+    target_tokens = output[:, 1:]
+
+    policy_token_logprobs = gather_token_logprobs(policy_logits, target_tokens)
+    reference_token_logprobs = gather_token_logprobs(reference_logits, target_tokens)
+
+    generated_policy_logprobs = policy_token_logprobs[:, input_len - 1:]
+    generated_reference_logprobs = reference_token_logprobs[:, input_len - 1:]
+    generated_values = values[:, input_len - 1:-1]
+    final_value_estimate = values[0, -1].item()
+
+    has_tags = raw_new_text.startswith(START_TAG) and raw_new_text.endswith(END_TAG)
+    body = raw_new_text[len(START_TAG):-len(END_TAG)].strip() if has_tags else ""
+    is_exact = has_tags and body.lstrip("-").isdigit()
+
+    reward_score = reward(parsed_answer, target_answer, trimmed_new_text, output_token_count)
+    is_correct = parsed_answer == target_answer
+
+    return RolloutRecord(
+        prompt_question=prompt_question,
+        target_answer=target_answer,
+        input_len=input_len,
+        output_len=output_len,
+        output_ids=output[0].detach().cpu(),
+        generated_token_ids=new_tokens.detach().cpu(),
+        final_text=final_text,
+        parsed_answer=parsed_answer,
+        output_token_count=output_token_count,
+        exact_format=is_exact,
+        policy_logprobs=generated_policy_logprobs[0].detach().cpu(),
+        reference_logprobs=generated_reference_logprobs[0].detach().cpu(),
+        generated_values=generated_values[0].detach().cpu(),
+        final_value_estimate=final_value_estimate,
+        reward_score=reward_score,
+        is_correct=is_correct,
+    )
+
+
+def evaluate_policy(policy, tokenizer, device, label="EVAL"):
+    """Run deterministic evaluation on all questions. Returns metrics dict."""
+    policy.eval()
+    correct = 0
+    exact_format_count = 0
+    total_reward = 0.0
+    total_output_len = 0
+    level_correct = [0, 0, 0]
+    num_questions = len(PROMPT_QUESTIONS)
+
+    for i, (prompt_question, target_answer) in enumerate(zip(PROMPT_QUESTIONS, GROUND_TRUTH)):
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt_question},
         ]
         prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
+            messages, tokenize=False, add_generation_prompt=True,
         )
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         with torch.no_grad():
             output = policy.generate(
                 **inputs,
                 max_new_tokens=32,
-                do_sample=False, # deterministic generation
+                do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
             )
-        # get input and output lengths
+
         input_len = inputs["input_ids"].shape[1]
         output_len = output[0].shape[0]
-
-        # print input and output lengths
-        print(f"QUESTION: {prompt_question}")
-        print(f"input length: {input_len}, output length: {output_len}")
-
-        # get only the newly generated tokens and decode them 
         new_tokens = output[0][input_len:]
         raw_new_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-
-        # trim to final response
         trimmed_new_text = trim_to_final_response(raw_new_text)
         final_text = trimmed_new_text if trimmed_new_text != raw_new_text else raw_new_text
-
-        # parse the answer
         parsed_answer = parse_answer(final_text)
         new_token_count = output_len - input_len
-        full_attention_mask = torch.ones_like(output, device=device)
-        with torch.no_grad():
-            _, values = policy(input_ids=output, attention_mask=full_attention_mask)
-        final_value_estimate = values[0][-1].item()
 
-        # output length tracking and exact format tracking
         total_output_len += new_token_count
         has_tags = raw_new_text.startswith(START_TAG) and raw_new_text.endswith(END_TAG)
         body = raw_new_text[len(START_TAG):-len(END_TAG)].strip() if has_tags else ""
         is_exact = has_tags and body.lstrip("-").isdigit()
 
         if is_exact:
-            exact_format += 1
-        
-        
-        # reward tracking
+            exact_format_count += 1
+
         reward_score = reward(parsed_answer, target_answer, trimmed_new_text, new_token_count)
         total_reward += reward_score
-        print("NEW TEXT:")
-        print(repr(final_text))
-        print(f"PARSED ANSWER: {parsed_answer}")
-        print(f"GROUND TRUTH: {target_answer}")
-        print(f"EXACT FORMAT: {is_exact} | OUTPUT TOKENS: {new_token_count}")
-        print(f"VALUE ESTIMATE: {final_value_estimate:.4f}")
-        if (parsed_answer == target_answer):
-            print("CORRECT")
-            correct+=1
+
+        if parsed_answer == target_answer:
+            correct += 1
             level_correct[i // 10] += 1
-        else:
-            print("INCORRECT")
-        print(f"REWARD SCORE: {reward_score}")
-        print()
-    print("=" * 40)
+
+    print(f"\n{'=' * 40}")
+    print(f"  {label}")
+    print(f"{'=' * 40}")
     for lvl in range(3):
         r = level_correct[lvl]
-        print(f"{level_names[lvl]}: {r}/10 right, {10 - r}/10 wrong")
-    print(f"TOTAL: {correct}/30 right, {30 - correct}/30 wrong")
-    print(f"ACCURACY: {correct / 30:.1%}")
-    print(f"EXACT FORMAT RATE: {exact_format}/30 ({exact_format / 30:.1%})")
-    print(f"AVG OUTPUT LENGTH: {total_output_len / 30:.4f} tokens")
-    print(f"TOTAL REWARD: {total_reward}")
-    print(f"AVG REWARD: {total_reward / 30:.4f}")
-    
+        print(f"  {LEVEL_NAMES[lvl]}: {r}/10")
+    print(f"  ACCURACY: {correct}/{num_questions} ({correct / num_questions:.1%})")
+    print(f"  EXACT FORMAT RATE: {exact_format_count}/{num_questions} ({exact_format_count / num_questions:.1%})")
+    print(f"  AVG OUTPUT LENGTH: {total_output_len / num_questions:.1f} tokens")
+    print(f"  AVG REWARD: {total_reward / num_questions:.4f}")
+    print(f"{'=' * 40}\n")
+
+    return {
+        "correct": correct,
+        "accuracy": correct / num_questions,
+        "exact_format": exact_format_count,
+        "exact_format_rate": exact_format_count / num_questions,
+        "avg_output_len": total_output_len / num_questions,
+        "avg_reward": total_reward / num_questions,
+        "level_correct": level_correct,
+    }
+
+
+def train_ppo_epoch(policy, reference_model, tokenizer, optimizer, device, epoch):
+    """Collect rollouts with sampling and run one PPO update. Returns stats."""
+    rollout_records = []
+    ppo_targets_list = []
+    num_correct = 0
+    total_reward = 0.0
+
+    for i, (prompt_question, target_answer) in enumerate(zip(PROMPT_QUESTIONS, GROUND_TRUTH)):
+        rollout = collect_rollout_record(
+            policy=policy,
+            reference_model=reference_model,
+            tokenizer=tokenizer,
+            prompt_question=prompt_question,
+            target_answer=target_answer,
+            device=device,
+            do_sample=True,
+        )
+        targets = build_ppo_targets(rollout)
+        rollout_records.append(rollout)
+        ppo_targets_list.append(targets)
+
+        if rollout.is_correct:
+            num_correct += 1
+        total_reward += rollout.reward_score
+
+    num_questions = len(PROMPT_QUESTIONS)
+    print(f"  Epoch {epoch + 1} rollouts: {num_correct}/{num_questions} correct, avg reward {total_reward / num_questions:.4f}")
+
+    update_stats = ppo_update(policy, optimizer, rollout_records, ppo_targets_list, device)
+    print(f"  Epoch {epoch + 1} update: policy_loss={update_stats['policy_loss']:.4f} value_loss={update_stats['value_loss']:.4f} kl={update_stats['reference_kl']:.4f} total_loss={update_stats['total_loss']:.4f}")
+
+    return update_stats
+
+
+def main():
+    # set seeds for reproducibility
+    random.seed(SEED)
+    torch.manual_seed(SEED)
+
+    device = "cpu"
+    dtype = torch.float32
+
+    print(f"Loading {MODEL_ID}...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+
+    # build policy with LoRA + value head
+    lora_model = build_lora_model(MODEL_ID, dtype)
+    policy = PolicyWithValueHead(lora_model).to(device)
+    policy.eval()
+
+    optimizer = torch.optim.Adam(
+        [param for param in policy.parameters() if param.requires_grad],
+        lr=LEARNING_RATE,
+    )
+
+    # frozen reference model for KL penalty
+    reference_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        torch_dtype=dtype,
+        attn_implementation="eager",
+    ).to(device)
+    for param in reference_model.parameters():
+        param.requires_grad = False
+    reference_model.eval()
+
+    # pre-training evaluation
+    print("Pre-training evaluation...")
+    pre_metrics = evaluate_policy(policy, tokenizer, device, label="PRE-TRAINING BASELINE")
+
+    # training loop
+    print(f"Starting PPO training for {NUM_EPOCHS} epochs...")
+    for epoch in range(NUM_EPOCHS):
+        train_ppo_epoch(policy, reference_model, tokenizer, optimizer, device, epoch)
+
+    # post-training evaluation
+    print("Post-training evaluation...")
+    post_metrics = evaluate_policy(policy, tokenizer, device, label="POST-TRAINING")
+
+    # comparison
+    print("=" * 40)
+    print("  BEFORE vs AFTER")
+    print("=" * 40)
+    print(f"  Accuracy:     {pre_metrics['accuracy']:.1%} -> {post_metrics['accuracy']:.1%}")
+    print(f"  Exact format: {pre_metrics['exact_format_rate']:.1%} -> {post_metrics['exact_format_rate']:.1%}")
+    print(f"  Avg reward:   {pre_metrics['avg_reward']:.4f} -> {post_metrics['avg_reward']:.4f}")
+    print(f"  Avg length:   {pre_metrics['avg_output_len']:.1f} -> {post_metrics['avg_output_len']:.1f}")
+    print("=" * 40)
+
+    # save trained adapters
+    save_lora_adapters(policy.policy_model, ADAPTER_SAVE_PATH)
+
+
 if __name__ == "__main__":
-    smoke_test()
+    main()
