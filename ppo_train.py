@@ -82,16 +82,19 @@ class PolicyWithValueHead(nn.Module):
 
 
 def gather_token_logprobs(logits, tokens):
-    log_probs = torch.log_softmax(logits, dim=-1)
-    token_log_probs = log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
-    return token_log_probs
+    log_probs = torch.log_softmax(logits, dim=-1) # converting all logits to probabilities 
+    token_log_probs = log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1) # gather the log probabilities for the tokens 
+    return token_log_probs # return the log probabilities for the tokens
 
 
 def reward(parsed_answer, ground_truth, raw_text, num_tokens):
+    stripped = raw_text.strip()
+    bare_integer=stripped.lstrip("-").isdigit()
     score = 0.0
     has_tags = raw_text.startswith(START_TAG) and raw_text.endswith(END_TAG)
     body = raw_text[len(START_TAG):-len(END_TAG)].strip() if has_tags else ""
-    exact_format = has_tags and body.lstrip("-").isdigit()
+    tagged_integer = has_tags and body.lstrip("-").isdigit()
+    exact_format = bare_integer or tagged_integer
 
     if parsed_answer is None:
         score -= 0.5
@@ -138,17 +141,17 @@ def trim_to_final_response(text):
 
 
 def build_ppo_targets(rollout: RolloutRecord):
-    old_policy_logprobs = rollout.policy_logprobs
+    old_policy_logprobs = rollout.policy_logprobs 
     reference_logprobs = rollout.reference_logprobs
-    generated_values = rollout.generated_values
+    generated_values = rollout.generated_values # value head's prediction at those positions
 
     reward_tensor = torch.tensor(rollout.reward_score, dtype=generated_values.dtype)
-    returns = torch.full_like(generated_values, fill_value=reward_tensor.item())
-    advantages = returns - generated_values
+    returns = torch.full_like(generated_values, fill_value=reward_tensor.item())  # input shape of generated values and filled with reward_tensor value
+    advantages = returns - generated_values # actual - predicted
     final_advantage = rollout.reward_score - rollout.final_value_estimate
 
-    reference_kl_per_token = old_policy_logprobs - reference_logprobs
-    reference_kl_mean = reference_kl_per_token.mean().item()
+    reference_kl_per_token = old_policy_logprobs - reference_logprobs # KL penalty for each token
+    reference_kl_mean = reference_kl_per_token.mean().item() # average KL penalty
 
     return PPOTargets(
         old_policy_logprobs=old_policy_logprobs,
@@ -170,16 +173,15 @@ def recompute_policy_stats(policy, rollout: RolloutRecord, device):
 
     policy_logits = policy_outputs.logits[:, :-1, :]
     target_tokens = output_ids[:, 1:]
-    policy_token_logprobs = gather_token_logprobs(policy_logits, target_tokens)
+    policy_token_logprobs = gather_token_logprobs(policy_logits, target_tokens) # pick log prob of the actual next token under the current policy
 
-    generated_policy_logprobs = policy_token_logprobs[:, rollout.input_len - 1:]
-    generated_values = values[:, rollout.input_len - 1:-1]
-    return generated_policy_logprobs[0], generated_values[0]
+    generated_policy_logprobs = policy_token_logprobs[:, rollout.input_len - 1:] # generated answer log probs 
+    generated_values = values[:, rollout.input_len - 1:-1] # generated answer values
+    return generated_policy_logprobs[0], generated_values[0] # return the generated answer log probs and generated value head estimate
 
 
 def ppo_update(policy, optimizer, rollout_records, ppo_targets, device):
     policy.train()
-
     policy_losses = []
     value_losses = []
     kl_terms = []
@@ -192,10 +194,10 @@ def ppo_update(policy, optimizer, rollout_records, ppo_targets, device):
         advantages = targets.advantages.to(device)
         returns = targets.returns.to(device)
 
-        ratios = torch.exp(new_policy_logprobs - old_policy_logprobs)
-        clipped_ratios = torch.clamp(ratios, 1 - CLIP_EPS, 1 + CLIP_EPS)
+        ratios = torch.exp(new_policy_logprobs - old_policy_logprobs) # ratio of the new policy log probs over the old policy log probs
+        clipped_ratios = torch.clamp(ratios, 1 - CLIP_EPS, 1 + CLIP_EPS) # bound the ratio between 0.8 and 1.2
 
-        unclipped_objective = ratios * advantages
+        unclipped_objective = ratios * advantages # without clipping
         clipped_objective = clipped_ratios * advantages
         policy_loss = -torch.min(unclipped_objective, clipped_objective).mean()
         value_loss = F.mse_loss(new_values, returns)
@@ -259,14 +261,14 @@ def collect_rollout_record(policy, reference_model, tokenizer, prompt_question, 
     input_len = inputs["input_ids"].shape[1]
     output_len = output[0].shape[0]
     new_tokens = output[0][input_len:]
-    raw_new_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-    trimmed_new_text = trim_to_final_response(raw_new_text)
+    raw_new_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip() # convert to string 
+    trimmed_new_text = trim_to_final_response(raw_new_text) # trim to final response
     final_text = trimmed_new_text if trimmed_new_text != raw_new_text else raw_new_text
     parsed_answer = parse_answer(final_text)
     output_token_count = output_len - input_len
 
-    full_attention_mask = torch.ones_like(output, device=device)
-    with torch.no_grad():
+    full_attention_mask = torch.ones_like(output, device=device) # attentin mask 
+    with torch.no_grad(): # inference no gradients
         policy_outputs, values = policy(input_ids=output, attention_mask=full_attention_mask)
         reference_outputs = reference_model(
             input_ids=output,
@@ -274,9 +276,19 @@ def collect_rollout_record(policy, reference_model, tokenizer, prompt_question, 
             return_dict=True,
         )
 
-    policy_logits = policy_outputs.logits[:, :-1, :]
-    reference_logits = reference_outputs.logits[:, :-1, :]
-    target_tokens = output[:, 1:]
+    policy_logits = policy_outputs.logits[:, :-1, :] # logits for the policy model [batch_size, sequence_length, vocab_size], drop the last token because there is no next token to predict
+    reference_logits = reference_outputs.logits[:, :-1, :] 
+    target_tokens = output[:, 1:] # drop the first token because there is no previous token to predict
+
+    # output = [A,B,C,D]
+    # logits row 0 logits row 0 = prediction for B after seeing A
+    # logits row 1 = prediction for C after seeing A, B
+    # logits row 2 = prediction for D after seeing A, B, C
+    # logits row 3 = prediction for the token after D
+    # after manipulation perfect matching
+    # logits row 0 compares to B
+    # logits row 1 compares to C
+    # logits row 2 compares to D
 
     policy_token_logprobs = gather_token_logprobs(policy_logits, target_tokens)
     reference_token_logprobs = gather_token_logprobs(reference_logits, target_tokens)
@@ -362,14 +374,14 @@ def evaluate_policy(policy, tokenizer, device, label="EVAL"):
 
         if parsed_answer == target_answer:
             correct += 1
-            level_correct[i // 10] += 1
+            level_correct[i // 67] += 1
 
     print(f"\n{'=' * 40}")
     print(f"  {label}")
     print(f"{'=' * 40}")
     for lvl in range(3):
         r = level_correct[lvl]
-        print(f"  {LEVEL_NAMES[lvl]}: {r}/10")
+        print(f"  {LEVEL_NAMES[lvl]}: {r}/67")
     print(f"  ACCURACY: {correct}/{num_questions} ({correct / num_questions:.1%})")
     print(f"  EXACT FORMAT RATE: {exact_format_count}/{num_questions} ({exact_format_count / num_questions:.1%})")
     print(f"  AVG OUTPUT LENGTH: {total_output_len / num_questions:.1f} tokens")
@@ -434,7 +446,7 @@ def main():
 
     # build policy with LoRA + value head
     lora_model = build_lora_model(MODEL_ID, dtype)
-    policy = PolicyWithValueHead(lora_model).to(device)
+    policy = PolicyWithValueHead(lora_model).to(device) 
     policy.eval()
 
     optimizer = torch.optim.Adam(
@@ -448,6 +460,7 @@ def main():
         torch_dtype=dtype,
         attn_implementation="eager",
     ).to(device)
+
     for param in reference_model.parameters():
         param.requires_grad = False
     reference_model.eval()

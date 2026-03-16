@@ -15,10 +15,13 @@ SYSTEM_PROMPT = (
 )
 
 def reward(parsed_answer, ground_truth, raw_text, num_tokens):
+    stripped = raw_text.strip()
+    bare_integer=stripped.lstrip("-").isdigit()
     score = 0.0
     has_tags = raw_text.startswith(START_TAG) and raw_text.endswith(END_TAG)
     body = raw_text[len(START_TAG):-len(END_TAG)].strip() if has_tags else ""
-    exact_format = has_tags and body.lstrip("-").isdigit()
+    tagged_integer = has_tags and body.lstrip("-").isdigit()
+    exact_format = bare_integer or tagged_integer
 
     if parsed_answer is None:
         score -= 0.5
@@ -146,7 +149,7 @@ def smoke_test():
         if (parsed_answer == target_answer):
             print("CORRECT")
             correct+=1
-            level_correct[i // 10] += 1
+            level_correct[i // 67] += 1
         else:
             print("INCORRECT")
         print(f"REWARD SCORE: {reward_score}")
@@ -154,7 +157,7 @@ def smoke_test():
     print("=" * 40)
     for lvl in range(3):
         r = level_correct[lvl]
-        print(f"{LEVEL_NAMES[lvl]}: {r}/10 right, {10 - r}/10 wrong")
+        print(f"{LEVEL_NAMES[lvl]}: {r}/67 right, {67 - r}/67 wrong")
     print(f"TOTAL: {correct}/{num_questions} right, {num_questions - correct}/{num_questions} wrong")
     print(f"ACCURACY: {correct / num_questions:.1%}")
     print(f"EXACT FORMAT RATE: {exact_format}/{num_questions} ({exact_format / num_questions:.1%})")
