@@ -6,7 +6,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from lora import build_lora_model, save_lora_adapters
-from data import PROMPT_QUESTIONS, GROUND_TRUTH, LEVEL_NAMES
+from data import (
+    EVAL_GROUND_TRUTH,
+    EVAL_LEVEL_COUNTS,
+    EVAL_LEVEL_IDS,
+    EVAL_PROMPT_QUESTIONS,
+    LEVEL_NAMES,
+    TRAIN_GROUND_TRUTH,
+    TRAIN_LEVEL_COUNTS,
+    TRAIN_LEVEL_IDS,
+    TRAIN_PROMPT_QUESTIONS,
+)
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 START_TAG = "<final_response>"
@@ -17,6 +27,8 @@ SYSTEM_PROMPT = (
     "<final_response>INTEGER</final_response>. "
     "Do not show reasoning or examples."
 )
+
+
 
 SEED = 42
 NUM_EPOCHS = 50
@@ -333,9 +345,9 @@ def evaluate_policy(policy, tokenizer, device, label="EVAL"):
     total_reward = 0.0
     total_output_len = 0
     level_correct = [0, 0, 0]
-    num_questions = len(PROMPT_QUESTIONS)
+    num_questions = len(EVAL_PROMPT_QUESTIONS)
 
-    for i, (prompt_question, target_answer) in enumerate(zip(PROMPT_QUESTIONS, GROUND_TRUTH)):
+    for i, (prompt_question, target_answer) in enumerate(zip(EVAL_PROMPT_QUESTIONS, EVAL_GROUND_TRUTH)):
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt_question},
@@ -374,14 +386,14 @@ def evaluate_policy(policy, tokenizer, device, label="EVAL"):
 
         if parsed_answer == target_answer:
             correct += 1
-            level_correct[i // 67] += 1
+            level_correct[EVAL_LEVEL_IDS[i]] += 1
 
     print(f"\n{'=' * 40}")
     print(f"  {label}")
     print(f"{'=' * 40}")
     for lvl in range(3):
         r = level_correct[lvl]
-        print(f"  {LEVEL_NAMES[lvl]}: {r}/67")
+        print(f"  {LEVEL_NAMES[lvl]}: {r}/{EVAL_LEVEL_COUNTS[lvl]}")
     print(f"  ACCURACY: {correct}/{num_questions} ({correct / num_questions:.1%})")
     print(f"  EXACT FORMAT RATE: {exact_format_count}/{num_questions} ({exact_format_count / num_questions:.1%})")
     print(f"  AVG OUTPUT LENGTH: {total_output_len / num_questions:.1f} tokens")
@@ -406,7 +418,7 @@ def train_ppo_epoch(policy, reference_model, tokenizer, optimizer, device, epoch
     num_correct = 0
     total_reward = 0.0
 
-    for i, (prompt_question, target_answer) in enumerate(zip(PROMPT_QUESTIONS, GROUND_TRUTH)):
+    for i, (prompt_question, target_answer) in enumerate(zip(TRAIN_PROMPT_QUESTIONS, TRAIN_GROUND_TRUTH)):
         rollout = collect_rollout_record(
             policy=policy,
             reference_model=reference_model,
@@ -424,7 +436,7 @@ def train_ppo_epoch(policy, reference_model, tokenizer, optimizer, device, epoch
             num_correct += 1
         total_reward += rollout.reward_score
 
-    num_questions = len(PROMPT_QUESTIONS)
+    num_questions = len(TRAIN_PROMPT_QUESTIONS)
     print(f"  Epoch {epoch + 1} rollouts: {num_correct}/{num_questions} correct, avg reward {total_reward / num_questions:.4f}")
 
     update_stats = ppo_update(policy, optimizer, rollout_records, ppo_targets_list, device)

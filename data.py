@@ -1,3 +1,5 @@
+import random
+
 PROMPT_QUESTIONS = [
     # Level 1: Basic Arithmetic (67)
     "What is 12 + 19? Answer with only the integer.",
@@ -237,3 +239,60 @@ GROUND_TRUTH = [
 ]
 
 LEVEL_NAMES = ["Level 1: Basic Arithmetic", "Level 2: Multi-Step", "Level 3: Word Problems"]
+
+SPLIT_SEED = 42
+LEVEL_SIZE = 67
+TRAIN_PER_LEVEL = 53
+EVAL_PER_LEVEL = LEVEL_SIZE - TRAIN_PER_LEVEL
+
+
+def _build_stratified_split():
+    assert len(PROMPT_QUESTIONS) == len(GROUND_TRUTH) == LEVEL_SIZE * len(LEVEL_NAMES)
+
+    train_questions = []
+    train_answers = []
+    train_level_ids = []
+    eval_questions = []
+    eval_answers = []
+    eval_level_ids = []
+
+    for level_idx in range(len(LEVEL_NAMES)):
+        start = level_idx * LEVEL_SIZE
+        end = start + LEVEL_SIZE
+        level_examples = list(zip(PROMPT_QUESTIONS[start:end], GROUND_TRUTH[start:end]))
+
+        rng = random.Random(SPLIT_SEED + level_idx)
+        rng.shuffle(level_examples)
+
+        train_examples = level_examples[:TRAIN_PER_LEVEL]
+        eval_examples = level_examples[TRAIN_PER_LEVEL:]
+
+        train_questions.extend(question for question, _ in train_examples)
+        train_answers.extend(answer for _, answer in train_examples)
+        train_level_ids.extend([level_idx] * len(train_examples))
+
+        eval_questions.extend(question for question, _ in eval_examples)
+        eval_answers.extend(answer for _, answer in eval_examples)
+        eval_level_ids.extend([level_idx] * len(eval_examples))
+
+    return (
+        train_questions,
+        train_answers,
+        train_level_ids,
+        eval_questions,
+        eval_answers,
+        eval_level_ids,
+    )
+
+
+(
+    TRAIN_PROMPT_QUESTIONS,
+    TRAIN_GROUND_TRUTH,
+    TRAIN_LEVEL_IDS,
+    EVAL_PROMPT_QUESTIONS,
+    EVAL_GROUND_TRUTH,
+    EVAL_LEVEL_IDS,
+) = _build_stratified_split()
+
+TRAIN_LEVEL_COUNTS = [TRAIN_PER_LEVEL] * len(LEVEL_NAMES)
+EVAL_LEVEL_COUNTS = [EVAL_PER_LEVEL] * len(LEVEL_NAMES)

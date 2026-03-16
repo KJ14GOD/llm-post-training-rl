@@ -2,7 +2,13 @@ import re
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from lora import build_lora_model
-from data import PROMPT_QUESTIONS, GROUND_TRUTH, LEVEL_NAMES
+from data import (
+    EVAL_GROUND_TRUTH,
+    EVAL_LEVEL_COUNTS,
+    EVAL_LEVEL_IDS,
+    EVAL_PROMPT_QUESTIONS,
+    LEVEL_NAMES,
+)
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 START_TAG = "<final_response>"
@@ -74,7 +80,7 @@ def smoke_test():
     exact_format = 0
     total_output_len = 0
     level_correct = [0, 0, 0]
-    num_questions = len(PROMPT_QUESTIONS)
+    num_questions = len(EVAL_PROMPT_QUESTIONS)
     device = "cpu"
     dtype = torch.float16 if device == "mps" else torch.float32
 
@@ -90,7 +96,7 @@ def smoke_test():
     model.to(device)
     model.eval()
 
-    for i, (prompt_question, target_answer) in enumerate(zip(PROMPT_QUESTIONS, GROUND_TRUTH)):
+    for i, (prompt_question, target_answer) in enumerate(zip(EVAL_PROMPT_QUESTIONS, EVAL_GROUND_TRUTH)):
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt_question},
@@ -149,7 +155,7 @@ def smoke_test():
         if (parsed_answer == target_answer):
             print("CORRECT")
             correct+=1
-            level_correct[i // 67] += 1
+            level_correct[EVAL_LEVEL_IDS[i]] += 1
         else:
             print("INCORRECT")
         print(f"REWARD SCORE: {reward_score}")
@@ -157,7 +163,8 @@ def smoke_test():
     print("=" * 40)
     for lvl in range(3):
         r = level_correct[lvl]
-        print(f"{LEVEL_NAMES[lvl]}: {r}/67 right, {67 - r}/67 wrong")
+        level_total = EVAL_LEVEL_COUNTS[lvl]
+        print(f"{LEVEL_NAMES[lvl]}: {r}/{level_total} right, {level_total - r}/{level_total} wrong")
     print(f"TOTAL: {correct}/{num_questions} right, {num_questions - correct}/{num_questions} wrong")
     print(f"ACCURACY: {correct / num_questions:.1%}")
     print(f"EXACT FORMAT RATE: {exact_format}/{num_questions} ({exact_format / num_questions:.1%})")
