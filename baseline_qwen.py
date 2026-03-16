@@ -74,15 +74,14 @@ def trim_to_final_response(text):
     return text.split(END_TAG, 1)[0] + END_TAG
 
 def smoke_test():
-    # device = "mps" if torch.backends.mps.is_available() else "cpu" 
     correct = 0
     total_reward = 0.0
     exact_format = 0
     total_output_len = 0
     level_correct = [0, 0, 0]
     num_questions = len(EVAL_PROMPT_QUESTIONS)
-    device = "cpu"
-    dtype = torch.float16 if device == "mps" else torch.float32
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
 
     print(f"loading {MODEL_ID} on {device}...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
