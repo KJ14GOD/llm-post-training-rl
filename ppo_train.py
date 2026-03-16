@@ -452,7 +452,7 @@ def main():
     torch.manual_seed(SEED)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float32
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     print(f"Loading {MODEL_ID}...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)

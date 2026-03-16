@@ -81,7 +81,7 @@ def smoke_test():
     level_correct = [0, 0, 0]
     num_questions = len(EVAL_PROMPT_QUESTIONS)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float32
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     print(f"loading {MODEL_ID} on {device}...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
