@@ -79,7 +79,8 @@ class PolicyWithValueHead(nn.Module):
         super().__init__()
         self.policy_model = policy_model
         hidden_size = policy_model.config.hidden_size
-        self.value_head = nn.Linear(hidden_size, 1)
+        policy_dtype = next(policy_model.parameters()).dtype
+        self.value_head = nn.Linear(hidden_size, 1, dtype=policy_dtype)
 
     def forward(self, *args, **kwargs):
         kwargs["output_hidden_states"] = True
