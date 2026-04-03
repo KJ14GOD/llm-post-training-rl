@@ -19,12 +19,9 @@ from data import (
 )
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
-START_TAG = "<final_response>"
-END_TAG = "</final_response>"
 SYSTEM_PROMPT = (
     "You are a precise math assistant. "
-    "Return exactly one XML block in this format: "
-    "<final_response>INTEGER</final_response>. "
+    "Answer with only the integer. "
     "Do not show reasoning or examples."
 )
 
@@ -38,7 +35,13 @@ VALUE_COEF = 0.1
 KL_COEF = 0.01
 MAX_GRAD_NORM = 1.0
 SAMPLE_TEMPERATURE = 0.7
+GAE_GAMMA = 0.99
+GAE_LAMBDA = 0.95
+EVAL_EVERY = 5
+PPO_UPDATE_EPOCHS = 4
+MINIBATCH_SIZE = 16
 ADAPTER_SAVE_PATH = "./lora_adapters"
+BEST_ADAPTER_SAVE_PATH = "./lora_adapters_best"
 
 
 @dataclass
@@ -101,13 +104,8 @@ def gather_token_logprobs(logits, tokens):
 
 
 def reward(parsed_answer, ground_truth, raw_text, num_tokens):
-    stripped = raw_text.strip()
-    bare_integer=stripped.lstrip("-").isdigit()
     score = 0.0
-    has_tags = raw_text.startswith(START_TAG) and raw_text.endswith(END_TAG)
-    body = raw_text[len(START_TAG):-len(END_TAG)].strip() if has_tags else ""
-    tagged_integer = has_tags and body.lstrip("-").isdigit()
-    exact_format = bare_integer or tagged_integer
+    exact_format = raw_text.strip().lstrip("-").isdigit()
 
     if parsed_answer is None:
         score -= 0.5
@@ -125,10 +123,7 @@ def reward(parsed_answer, ground_truth, raw_text, num_tokens):
 
 
 def parse_answer(text):
-    if text.startswith(START_TAG) and text.endswith(END_TAG):
-        body = text[len(START_TAG):-len(END_TAG)].strip()
-    else:
-        body = text.strip()
+    body = text.strip()
 
     try:
         return int(body)
@@ -146,25 +141,35 @@ def parse_answer(text):
     return None
 
 
-def trim_to_final_response(text):
-    if END_TAG not in text:
-        return text
-
-    return text.split(END_TAG, 1)[0] + END_TAG
-
-
 def build_ppo_targets(rollout: RolloutRecord):
-    old_policy_logprobs = rollout.policy_logprobs 
+    old_policy_logprobs = rollout.policy_logprobs
     reference_logprobs = rollout.reference_logprobs
     generated_values = rollout.generated_values # value head's prediction at those positions
+    num_tokens = generated_values.shape[0]
 
-    reward_tensor = torch.tensor(rollout.reward_score, dtype=generated_values.dtype)
-    returns = torch.full_like(generated_values, fill_value=reward_tensor.item())  # input shape of generated values and filled with reward_tensor value
-    advantages = returns - generated_values # actual - predicted
+    # GAE: walk backward through token positions
+    # reward only arrives at the last token, intermediate rewards are 0
+    advantages = torch.zeros_like(generated_values)
+    gae = 0.0
+    for t in reversed(range(num_tokens)):
+        if t == num_tokens - 1:
+            # last token: delta = reward - V(last)
+            next_value = 0.0
+            token_reward = rollout.reward_score
+        else:
+            # earlier tokens: no intermediate reward, just value difference
+            next_value = generated_values[t + 1].item()
+            token_reward = 0.0
+        delta = token_reward + GAE_GAMMA * next_value - generated_values[t].item()
+        gae = delta + GAE_GAMMA * GAE_LAMBDA * gae
+        advantages[t] = gae
+
+    returns = advantages + generated_values
     final_advantage = rollout.reward_score - rollout.final_value_estimate
 
-    reference_kl_per_token = old_policy_logprobs - reference_logprobs # KL penalty for each token
-    reference_kl_mean = reference_kl_per_token.mean().item() # average KL penalty
+    log_ratio = old_policy_logprobs - reference_logprobs
+    reference_kl_per_token = (torch.exp(log_ratio) - 1) - log_ratio  # k2 approximate KL estimator
+    reference_kl_mean = reference_kl_per_token.mean().item()
 
     return PPOTargets(
         old_policy_logprobs=old_policy_logprobs,
@@ -195,53 +200,74 @@ def recompute_policy_stats(policy, rollout: RolloutRecord, device):
 
 def ppo_update(policy, optimizer, rollout_records, ppo_targets, device):
     policy.train()
+    num_rollouts = len(rollout_records)
+    trainable_params = [p for p in policy.parameters() if p.requires_grad]
     policy_losses = []
     value_losses = []
     kl_terms = []
     total_losses = []
 
-    for rollout, targets in zip(rollout_records, ppo_targets):
-        new_policy_logprobs, new_values = recompute_policy_stats(policy, rollout, device)
-        old_policy_logprobs = targets.old_policy_logprobs.to(device)
-        reference_logprobs = targets.reference_logprobs.to(device)
-        advantages = targets.advantages.to(device)
-        returns = targets.returns.to(device)
+    for _ in range(PPO_UPDATE_EPOCHS):
+        shuffled_indices = list(range(num_rollouts))
+        random.shuffle(shuffled_indices)
 
-        ratios = torch.exp(new_policy_logprobs - old_policy_logprobs) # ratio of the new policy log probs over the old policy log probs
-        clipped_ratios = torch.clamp(ratios, 1 - CLIP_EPS, 1 + CLIP_EPS) # bound the ratio between 0.8 and 1.2
+        for start_idx in range(0, num_rollouts, MINIBATCH_SIZE):
+            minibatch_indices = shuffled_indices[start_idx:start_idx + MINIBATCH_SIZE]
+            minibatch_policy_losses = []
+            minibatch_value_losses = []
+            minibatch_kl_terms = []
+            minibatch_total_losses = []
 
-        unclipped_objective = ratios * advantages # without clipping
-        clipped_objective = clipped_ratios * advantages
-        policy_loss = -torch.min(unclipped_objective, clipped_objective).mean()
-        value_loss = F.mse_loss(new_values, returns)
-        reference_kl = (new_policy_logprobs - reference_logprobs).mean()
+            for idx in minibatch_indices:
+                rollout = rollout_records[idx]
+                targets = ppo_targets[idx]
 
-        total_loss = policy_loss + (VALUE_COEF * value_loss) + (KL_COEF * reference_kl)
+                new_policy_logprobs, new_values = recompute_policy_stats(policy, rollout, device)
+                old_policy_logprobs = targets.old_policy_logprobs.to(device)
+                reference_logprobs = targets.reference_logprobs.to(device)
+                advantages = targets.advantages.to(device)
+                returns = targets.returns.to(device)
 
-        policy_losses.append(policy_loss)
-        value_losses.append(value_loss)
-        kl_terms.append(reference_kl)
-        total_losses.append(total_loss)
+                ratios = torch.exp(new_policy_logprobs - old_policy_logprobs)
+                clipped_ratios = torch.clamp(ratios, 1 - CLIP_EPS, 1 + CLIP_EPS)
 
-    mean_policy_loss = torch.stack(policy_losses).mean()
-    mean_value_loss = torch.stack(value_losses).mean()
-    mean_reference_kl = torch.stack(kl_terms).mean()
-    mean_total_loss = torch.stack(total_losses).mean()
+                unclipped_objective = ratios * advantages
+                clipped_objective = clipped_ratios * advantages
+                policy_loss = -torch.min(unclipped_objective, clipped_objective).mean()
+                value_loss = F.mse_loss(new_values, returns)
+                kl_log_ratio = new_policy_logprobs - reference_logprobs
+                reference_kl = ((torch.exp(kl_log_ratio) - 1) - kl_log_ratio).mean()
+                total_loss = policy_loss + (VALUE_COEF * value_loss) + (KL_COEF * reference_kl)
 
-    optimizer.zero_grad()
-    mean_total_loss.backward()
-    torch.nn.utils.clip_grad_norm_(
-        [p for p in policy.parameters() if p.requires_grad],
-        MAX_GRAD_NORM,
-    )
-    optimizer.step()
+                minibatch_policy_losses.append(policy_loss)
+                minibatch_value_losses.append(value_loss)
+                minibatch_kl_terms.append(reference_kl)
+                minibatch_total_losses.append(total_loss)
+
+            mean_policy_loss = torch.stack(minibatch_policy_losses).mean()
+            mean_value_loss = torch.stack(minibatch_value_losses).mean()
+            mean_reference_kl = torch.stack(minibatch_kl_terms).mean()
+            mean_total_loss = torch.stack(minibatch_total_losses).mean()
+
+            optimizer.zero_grad()
+            mean_total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, MAX_GRAD_NORM)
+            optimizer.step()
+
+            policy_losses.append(mean_policy_loss.detach())
+            value_losses.append(mean_value_loss.detach())
+            kl_terms.append(mean_reference_kl.detach())
+            total_losses.append(mean_total_loss.detach())
+
     policy.eval()
 
     return {
-        "policy_loss": mean_policy_loss.item(),
-        "value_loss": mean_value_loss.item(),
-        "reference_kl": mean_reference_kl.item(),
-        "total_loss": mean_total_loss.item(),
+        "policy_loss": torch.stack(policy_losses).mean().item(),
+        "value_loss": torch.stack(value_losses).mean().item(),
+        "reference_kl": torch.stack(kl_terms).mean().item(),
+        "total_loss": torch.stack(total_losses).mean().item(),
+        "ppo_update_epochs": PPO_UPDATE_EPOCHS,
+        "minibatch_size": MINIBATCH_SIZE,
     }
 
 
@@ -274,10 +300,8 @@ def collect_rollout_record(policy, reference_model, tokenizer, prompt_question, 
     input_len = inputs["input_ids"].shape[1]
     output_len = output[0].shape[0]
     new_tokens = output[0][input_len:]
-    raw_new_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip() # convert to string 
-    trimmed_new_text = trim_to_final_response(raw_new_text) # trim to final response
-    final_text = trimmed_new_text if trimmed_new_text != raw_new_text else raw_new_text
-    parsed_answer = parse_answer(final_text)
+    raw_new_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    parsed_answer = parse_answer(raw_new_text)
     output_token_count = output_len - input_len
 
     full_attention_mask = torch.ones_like(output, device=device) # attentin mask 
@@ -311,11 +335,9 @@ def collect_rollout_record(policy, reference_model, tokenizer, prompt_question, 
     generated_values = values[:, input_len - 1:-1]
     final_value_estimate = values[0, -1].item()
 
-    has_tags = raw_new_text.startswith(START_TAG) and raw_new_text.endswith(END_TAG)
-    body = raw_new_text[len(START_TAG):-len(END_TAG)].strip() if has_tags else ""
-    is_exact = has_tags and body.lstrip("-").isdigit()
+    is_exact = raw_new_text.strip().lstrip("-").isdigit()
 
-    reward_score = reward(parsed_answer, target_answer, trimmed_new_text, output_token_count)
+    reward_score = reward(parsed_answer, target_answer, raw_new_text, output_token_count)
     is_correct = parsed_answer == target_answer
 
     return RolloutRecord(
@@ -325,7 +347,7 @@ def collect_rollout_record(policy, reference_model, tokenizer, prompt_question, 
         output_len=output_len,
         output_ids=output[0].detach().cpu(),
         generated_token_ids=new_tokens.detach().cpu(),
-        final_text=final_text,
+        final_text=raw_new_text,
         parsed_answer=parsed_answer,
         output_token_count=output_token_count,
         exact_format=is_exact,
@@ -369,20 +391,16 @@ def evaluate_policy(policy, tokenizer, device, label="EVAL"):
         output_len = output[0].shape[0]
         new_tokens = output[0][input_len:]
         raw_new_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-        trimmed_new_text = trim_to_final_response(raw_new_text)
-        final_text = trimmed_new_text if trimmed_new_text != raw_new_text else raw_new_text
-        parsed_answer = parse_answer(final_text)
+        parsed_answer = parse_answer(raw_new_text)
         new_token_count = output_len - input_len
 
         total_output_len += new_token_count
-        has_tags = raw_new_text.startswith(START_TAG) and raw_new_text.endswith(END_TAG)
-        body = raw_new_text[len(START_TAG):-len(END_TAG)].strip() if has_tags else ""
-        is_exact = has_tags and body.lstrip("-").isdigit()
+        is_exact = raw_new_text.strip().lstrip("-").isdigit()
 
         if is_exact:
             exact_format_count += 1
 
-        reward_score = reward(parsed_answer, target_answer, trimmed_new_text, new_token_count)
+        reward_score = reward(parsed_answer, target_answer, raw_new_text, new_token_count)
         total_reward += reward_score
 
         if parsed_answer == target_answer:
@@ -440,8 +458,22 @@ def train_ppo_epoch(policy, reference_model, tokenizer, optimizer, device, epoch
     num_questions = len(TRAIN_PROMPT_QUESTIONS)
     print(f"  Epoch {epoch + 1} rollouts: {num_correct}/{num_questions} correct, avg reward {total_reward / num_questions:.4f}")
 
+    # normalize advantages across the batch
+    all_advantages = torch.cat([t.advantages for t in ppo_targets_list])
+    adv_mean = all_advantages.mean()
+    adv_std = all_advantages.std()
+    for t in ppo_targets_list:
+        t.advantages = (t.advantages - adv_mean) / (adv_std + 1e-8)
+
     update_stats = ppo_update(policy, optimizer, rollout_records, ppo_targets_list, device)
-    print(f"  Epoch {epoch + 1} update: policy_loss={update_stats['policy_loss']:.4f} value_loss={update_stats['value_loss']:.4f} kl={update_stats['reference_kl']:.4f} total_loss={update_stats['total_loss']:.4f}")
+    print(
+        f"  Epoch {epoch + 1} update: "
+        f"policy_loss={update_stats['policy_loss']:.4f} "
+        f"value_loss={update_stats['value_loss']:.4f} "
+        f"kl={update_stats['reference_kl']:.4f} "
+        f"total_loss={update_stats['total_loss']:.4f} "
+        f"(ppo_passes={update_stats['ppo_update_epochs']}, minibatch_size={update_stats['minibatch_size']})"
+    )
 
     return update_stats
 
@@ -481,11 +513,19 @@ def main():
     # pre-training evaluation
     print("Pre-training evaluation...")
     pre_metrics = evaluate_policy(policy, tokenizer, device, label="PRE-TRAINING BASELINE")
+    best_reward = pre_metrics["avg_reward"]
 
     # training loop
     print(f"Starting PPO training for {NUM_EPOCHS} epochs...")
     for epoch in range(NUM_EPOCHS):
         train_ppo_epoch(policy, reference_model, tokenizer, optimizer, device, epoch)
+
+        if (epoch + 1) % EVAL_EVERY == 0:
+            metrics = evaluate_policy(policy, tokenizer, device, label=f"EVAL EPOCH {epoch + 1}")
+            if metrics["avg_reward"] > best_reward:
+                best_reward = metrics["avg_reward"]
+                save_lora_adapters(policy.policy_model, BEST_ADAPTER_SAVE_PATH)
+                print(f"  New best reward: {best_reward:.4f} — saved to {BEST_ADAPTER_SAVE_PATH}")
 
     # post-training evaluation
     print("Post-training evaluation...")

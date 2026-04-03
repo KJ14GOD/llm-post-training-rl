@@ -1,4 +1,3 @@
-import re
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from lora import build_lora_model
@@ -11,23 +10,15 @@ from data import (
 )
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
-START_TAG = "<final_response>"
-END_TAG = "</final_response>"
 SYSTEM_PROMPT = (
     "You are a precise math assistant. "
-    "Return exactly one XML block in this format: "
-    "<final_response>INTEGER</final_response>. "
+    "Answer with only the integer. "
     "Do not show reasoning or examples."
 )
 
 def reward(parsed_answer, ground_truth, raw_text, num_tokens):
-    stripped = raw_text.strip()
-    bare_integer=stripped.lstrip("-").isdigit()
     score = 0.0
-    has_tags = raw_text.startswith(START_TAG) and raw_text.endswith(END_TAG)
-    body = raw_text[len(START_TAG):-len(END_TAG)].strip() if has_tags else ""
-    tagged_integer = has_tags and body.lstrip("-").isdigit()
-    exact_format = bare_integer or tagged_integer
+    exact_format = raw_text.strip().lstrip("-").isdigit()
 
     if parsed_answer is None:
         score -= 0.5
@@ -44,18 +35,13 @@ def reward(parsed_answer, ground_truth, raw_text, num_tokens):
     return score
 
 def parse_answer(text):
-    if text.startswith(START_TAG) and text.endswith(END_TAG):
-        body = text[len(START_TAG):-len(END_TAG)].strip()
-    else:
-        body = text.strip()
+    body = text.strip()
 
-    # best case: just one integer
     try:
         return int(body)
     except ValueError:
         pass
 
-    # fallback: split by spaces, go backward, return first int found
     parts = body.split()
     for part in reversed(parts):
         cleaned = part.strip(".,!?()[]{}")
@@ -65,13 +51,6 @@ def parse_answer(text):
             continue
 
     return None
-
-
-def trim_to_final_response(text):
-    if END_TAG not in text:
-        return text
-
-    return text.split(END_TAG, 1)[0] + END_TAG
 
 def smoke_test():
     correct = 0
@@ -125,29 +104,19 @@ def smoke_test():
         new_tokens = output[0][input_len:]
         raw_new_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
-        # trim to final response
-        trimmed_new_text = trim_to_final_response(raw_new_text)
-        final_text = trimmed_new_text if trimmed_new_text != raw_new_text else raw_new_text
-
-        # parse the answer
-        parsed_answer = parse_answer(final_text)
+        parsed_answer = parse_answer(raw_new_text)
         new_token_count = output_len - input_len
 
-        # output length tracking and exact format tracking
         total_output_len += new_token_count
-        has_tags = raw_new_text.startswith(START_TAG) and raw_new_text.endswith(END_TAG)
-        body = raw_new_text[len(START_TAG):-len(END_TAG)].strip() if has_tags else ""
-        is_exact = has_tags and body.lstrip("-").isdigit()
+        is_exact = raw_new_text.strip().lstrip("-").isdigit()
 
         if is_exact:
             exact_format += 1
-        
-        
-        # reward tracking
-        reward_score = reward(parsed_answer, target_answer, trimmed_new_text, new_token_count)
+
+        reward_score = reward(parsed_answer, target_answer, raw_new_text, new_token_count)
         total_reward += reward_score
         print("NEW TEXT:")
-        print(repr(final_text))
+        print(repr(raw_new_text))
         print(f"PARSED ANSWER: {parsed_answer}")
         print(f"GROUND TRUTH: {target_answer}")
         print(f"EXACT FORMAT: {is_exact} | OUTPUT TOKENS: {new_token_count}")
