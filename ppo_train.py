@@ -17,12 +17,15 @@ from data import (
     TRAIN_LEVEL_IDS,
     TRAIN_PROMPT_QUESTIONS,
 )
+from verifier import END_TAG, START_TAG, is_exact_format, parse_answer, reward, trim_to_final_response
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+MAX_NEW_TOKENS = 64
 SYSTEM_PROMPT = (
     "You are a precise math assistant. "
-    "Answer with only the integer. "
-    "Do not show reasoning or examples."
+    "You may reason briefly to solve the problem. "
+    f"Put the final answer on the last line as {START_TAG}INTEGER{END_TAG}. "
+    "Do not include any text after the closing tag."
 )
 
 
@@ -101,44 +104,6 @@ def gather_token_logprobs(logits, tokens):
     log_probs = torch.log_softmax(logits, dim=-1) # converting all logits to probabilities 
     token_log_probs = log_probs.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1) # gather the log probabilities for the tokens 
     return token_log_probs # return the log probabilities for the tokens
-
-
-def reward(parsed_answer, ground_truth, raw_text, num_tokens):
-    score = 0.0
-    exact_format = raw_text.strip().lstrip("-").isdigit()
-
-    if parsed_answer is None:
-        score -= 0.5
-    elif parsed_answer == ground_truth and exact_format:
-        score += 1.0
-    elif parsed_answer == ground_truth:
-        score += 0.5
-    else:
-        score -= 0.25
-
-    if parsed_answer == ground_truth and exact_format and num_tokens <= 10:
-        score += 0.05
-
-    return score
-
-
-def parse_answer(text):
-    body = text.strip()
-
-    try:
-        return int(body)
-    except ValueError:
-        pass
-
-    parts = body.split()
-    for part in reversed(parts):
-        cleaned = part.strip(".,!?()[]{}")
-        try:
-            return int(cleaned)
-        except ValueError:
-            continue
-
-    return None
 
 
 def build_ppo_targets(rollout: RolloutRecord):
@@ -285,7 +250,7 @@ def collect_rollout_record(policy, reference_model, tokenizer, prompt_question, 
 
     generate_kwargs = dict(
         **inputs,
-        max_new_tokens=32,
+        max_new_tokens=MAX_NEW_TOKENS,
         pad_token_id=tokenizer.eos_token_id,
     )
     if do_sample:
@@ -301,6 +266,7 @@ def collect_rollout_record(policy, reference_model, tokenizer, prompt_question, 
     output_len = output[0].shape[0]
     new_tokens = output[0][input_len:]
     raw_new_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    trimmed_new_text = trim_to_final_response(raw_new_text)
     parsed_answer = parse_answer(raw_new_text)
     output_token_count = output_len - input_len
 
@@ -335,7 +301,7 @@ def collect_rollout_record(policy, reference_model, tokenizer, prompt_question, 
     generated_values = values[:, input_len - 1:-1]
     final_value_estimate = values[0, -1].item()
 
-    is_exact = raw_new_text.strip().lstrip("-").isdigit()
+    is_exact = is_exact_format(raw_new_text)
 
     reward_score = reward(parsed_answer, target_answer, raw_new_text, output_token_count)
     is_correct = parsed_answer == target_answer
@@ -347,7 +313,7 @@ def collect_rollout_record(policy, reference_model, tokenizer, prompt_question, 
         output_len=output_len,
         output_ids=output[0].detach().cpu(),
         generated_token_ids=new_tokens.detach().cpu(),
-        final_text=raw_new_text,
+        final_text=trimmed_new_text,
         parsed_answer=parsed_answer,
         output_token_count=output_token_count,
         exact_format=is_exact,
@@ -382,7 +348,7 @@ def evaluate_policy(policy, tokenizer, device, label="EVAL"):
         with torch.no_grad():
             output = policy.generate(
                 **inputs,
-                max_new_tokens=32,
+                max_new_tokens=MAX_NEW_TOKENS,
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
             )
@@ -391,11 +357,12 @@ def evaluate_policy(policy, tokenizer, device, label="EVAL"):
         output_len = output[0].shape[0]
         new_tokens = output[0][input_len:]
         raw_new_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        trimmed_new_text = trim_to_final_response(raw_new_text)
         parsed_answer = parse_answer(raw_new_text)
         new_token_count = output_len - input_len
 
         total_output_len += new_token_count
-        is_exact = raw_new_text.strip().lstrip("-").isdigit()
+        is_exact = is_exact_format(raw_new_text)
 
         if is_exact:
             exact_format_count += 1

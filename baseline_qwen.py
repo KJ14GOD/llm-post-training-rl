@@ -1,6 +1,5 @@
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from lora import build_lora_model
 from data import (
     EVAL_GROUND_TRUTH,
     EVAL_LEVEL_COUNTS,
@@ -8,49 +7,16 @@ from data import (
     EVAL_PROMPT_QUESTIONS,
     LEVEL_NAMES,
 )
+from verifier import END_TAG, START_TAG, is_exact_format, parse_answer, reward, trim_to_final_response
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+MAX_NEW_TOKENS = 64
 SYSTEM_PROMPT = (
     "You are a precise math assistant. "
-    "Answer with only the integer. "
-    "Do not show reasoning or examples."
+    "You may reason briefly to solve the problem. "
+    f"Put the final answer on the last line as {START_TAG}INTEGER{END_TAG}. "
+    "Do not include any text after the closing tag."
 )
-
-def reward(parsed_answer, ground_truth, raw_text, num_tokens):
-    score = 0.0
-    exact_format = raw_text.strip().lstrip("-").isdigit()
-
-    if parsed_answer is None:
-        score -= 0.5
-    elif parsed_answer == ground_truth and exact_format:
-        score += 1.0
-    elif parsed_answer == ground_truth:
-        score += 0.5
-    else:
-        score -= 0.25
-
-    if parsed_answer == ground_truth and exact_format and num_tokens <= 10:
-        score += 0.05
-
-    return score
-
-def parse_answer(text):
-    body = text.strip()
-
-    try:
-        return int(body)
-    except ValueError:
-        pass
-
-    parts = body.split()
-    for part in reversed(parts):
-        cleaned = part.strip(".,!?()[]{}")
-        try:
-            return int(cleaned)
-        except ValueError:
-            continue
-
-    return None
 
 def smoke_test():
     correct = 0
@@ -88,7 +54,7 @@ def smoke_test():
         with torch.no_grad():
             output = model.generate(
                 **inputs,
-                max_new_tokens=32,
+                max_new_tokens=MAX_NEW_TOKENS,
                 do_sample=False, # deterministic generation
                 pad_token_id=tokenizer.eos_token_id,
             )
@@ -103,12 +69,13 @@ def smoke_test():
         # get only the newly generated tokens and decode them 
         new_tokens = output[0][input_len:]
         raw_new_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        trimmed_new_text = trim_to_final_response(raw_new_text)
 
         parsed_answer = parse_answer(raw_new_text)
         new_token_count = output_len - input_len
 
         total_output_len += new_token_count
-        is_exact = raw_new_text.strip().lstrip("-").isdigit()
+        is_exact = is_exact_format(raw_new_text)
 
         if is_exact:
             exact_format += 1
@@ -116,7 +83,7 @@ def smoke_test():
         reward_score = reward(parsed_answer, target_answer, raw_new_text, new_token_count)
         total_reward += reward_score
         print("NEW TEXT:")
-        print(repr(raw_new_text))
+        print(repr(trimmed_new_text))
         print(f"PARSED ANSWER: {parsed_answer}")
         print(f"GROUND TRUTH: {target_answer}")
         print(f"EXACT FORMAT: {is_exact} | OUTPUT TOKENS: {new_token_count}")
