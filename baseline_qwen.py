@@ -1,3 +1,5 @@
+import os
+
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from data import (
@@ -9,7 +11,7 @@ from data import (
 )
 from verifier import END_TAG, START_TAG, is_exact_format, parse_answer, reward, trim_to_final_response
 
-MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen2.5-3B-Instruct")
 MAX_NEW_TOKENS = 64
 SYSTEM_PROMPT = (
     "You are a precise math assistant. "
