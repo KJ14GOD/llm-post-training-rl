@@ -36,7 +36,7 @@ NUM_EPOCHS = 50
 LEARNING_RATE = 5e-5
 CLIP_EPS = 0.2
 VALUE_COEF = 0.1
-KL_COEF = 0.01
+KL_COEF = 0.1
 MAX_GRAD_NORM = 1.0
 SAMPLE_TEMPERATURE = 0.7
 GAE_GAMMA = 0.99
@@ -371,9 +371,13 @@ def evaluate_policy(policy, tokenizer, device, label="EVAL"):
         reward_score = reward(parsed_answer, target_answer, raw_new_text, new_token_count)
         total_reward += reward_score
 
-        if parsed_answer == target_answer:
+        is_correct = parsed_answer == target_answer
+        if is_correct:
             correct += 1
             level_correct[EVAL_LEVEL_IDS[i]] += 1
+
+        status = "CORRECT" if is_correct else "INCORRECT"
+        print(f"  [{status}] Q: {prompt_question[:60]}  A: {repr(trimmed_new_text)[:40]}  parsed={parsed_answer}  truth={target_answer}  reward={reward_score}")
 
     print(f"\n{'=' * 40}")
     print(f"  {label}")
@@ -422,6 +426,9 @@ def train_ppo_epoch(policy, reference_model, tokenizer, optimizer, device, epoch
         if rollout.is_correct:
             num_correct += 1
         total_reward += rollout.reward_score
+
+        status = "CORRECT" if rollout.is_correct else "INCORRECT"
+        print(f"    [{status}] Q: {prompt_question[:60]}  A: {repr(rollout.final_text)[:40]}  parsed={rollout.parsed_answer}  truth={target_answer}  reward={rollout.reward_score}")
 
     num_questions = len(TRAIN_PROMPT_QUESTIONS)
     print(f"  Epoch {epoch + 1} rollouts: {num_correct}/{num_questions} correct, avg reward {total_reward / num_questions:.4f}")
