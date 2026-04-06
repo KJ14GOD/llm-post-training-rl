@@ -53,7 +53,18 @@ def parse_answer(text: str) -> int | None:
     return None
 
 
-def reward(parsed_answer: int | None, ground_truth: int, raw_text: str, num_tokens: int) -> float:
+def check_intermediate_steps(raw_text: str, intermediate_results: list[int] | None) -> float:
+    """Give partial credit if the model's reasoning contains correct intermediate results."""
+    if not intermediate_results:
+        return 0.0
+    bonus = 0.0
+    for result in intermediate_results:
+        if str(result) in raw_text:
+            bonus += 0.1
+    return min(bonus, 0.2)  # cap at 0.2
+
+
+def reward(parsed_answer: int | None, ground_truth: int, raw_text: str, num_tokens: int, intermediate_results: list[int] | None = None) -> float:
     exact_format = is_exact_format(raw_text)
 
     if parsed_answer is None:
@@ -74,7 +85,10 @@ def reward(parsed_answer: int | None, ground_truth: int, raw_text: str, num_toke
         else:
             score = -0.25
 
-    if num_tokens > 64:
+        # partial credit for correct intermediate steps in reasoning
+        score += check_intermediate_steps(raw_text, intermediate_results)
+
+    if num_tokens > 128:
         score -= 0.05
 
     return score

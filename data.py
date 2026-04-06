@@ -240,6 +240,26 @@ GROUND_TRUTH = [
 
 LEVEL_NAMES = ["Level 1: Basic Arithmetic", "Level 2: Multi-Step", "Level 3: Word Problems"]
 
+# Intermediate results for Level 2 questions (the inner parenthesized operation)
+# Level 1 and Level 3 have no intermediate steps, so None
+# Level 2: (A op B) op2 C -> intermediate is A op B
+INTERMEDIATE_RESULTS = [
+    # Level 1 (67 x None)
+    *([None] * 67),
+
+    # Level 2 (67 entries) — each is [inner_result]
+    [31], [27], [391], [12], [93], [48], [408], [15], [91], [45],   # (12+19),(45-18),(23*17),(144/12),(56+37),(92-44),(34*12),(210/14),(63+28),(81-36)
+    [306], [28], [83], [47], [400], [16], [97], [38], [266], [13],  # (17*18),(196/7),(44+39),(88-41),(25*16),(240/15),(73+24),(65-27),(19*14),(156/12)
+    [105], [38], [273], [12], [105], [58], [297], [14], [65], [27], # (48+57),(91-53),(21*13),(132/11),(67+38),(84-26),(27*11),(168/12),(36+29),(75-48)
+    [372], [12], [112], [56], [418], [11], [98], [36], [360], [22], # (31*12),(180/15),(49+63),(93-37),(22*19),(154/14),(57+41),(88-52),(24*15),(198/9)
+    [109], [55], [306], [11], [90], [54], [336], [11], [102], [35], # (62+47),(99-44),(18*17),(176/16),(54+36),(83-29),(16*21),(220/20),(68+34),(74-39)
+    [364], [18], [87], [34], [364], [8], [96], [31], [330], [8],    # (26*14),(162/9),(59+28),(81-47),(28*13),(144/18),(71+25),(64-33),(15*22),(200/25)
+    [95], [39], [396], [18], [104], [49], [432],                    # (43+52),(97-58),(33*12),(216/12),(58+46),(90-41),(27*16)
+
+    # Level 3 (67 x None)
+    *([None] * 67),
+]
+
 SPLIT_SEED = 42
 LEVEL_SIZE = 67
 TRAIN_PER_LEVEL = 53
@@ -247,19 +267,25 @@ EVAL_PER_LEVEL = LEVEL_SIZE - TRAIN_PER_LEVEL
 
 
 def _build_stratified_split():
-    assert len(PROMPT_QUESTIONS) == len(GROUND_TRUTH) == LEVEL_SIZE * len(LEVEL_NAMES)
+    assert len(PROMPT_QUESTIONS) == len(GROUND_TRUTH) == len(INTERMEDIATE_RESULTS) == LEVEL_SIZE * len(LEVEL_NAMES)
 
     train_questions = []
     train_answers = []
+    train_intermediates = []
     train_level_ids = []
     eval_questions = []
     eval_answers = []
+    eval_intermediates = []
     eval_level_ids = []
 
     for level_idx in range(len(LEVEL_NAMES)):
         start = level_idx * LEVEL_SIZE
         end = start + LEVEL_SIZE
-        level_examples = list(zip(PROMPT_QUESTIONS[start:end], GROUND_TRUTH[start:end]))
+        level_examples = list(zip(
+            PROMPT_QUESTIONS[start:end],
+            GROUND_TRUTH[start:end],
+            INTERMEDIATE_RESULTS[start:end],
+        ))
 
         rng = random.Random(SPLIT_SEED + level_idx)
         rng.shuffle(level_examples)
@@ -267,20 +293,24 @@ def _build_stratified_split():
         train_examples = level_examples[:TRAIN_PER_LEVEL]
         eval_examples = level_examples[TRAIN_PER_LEVEL:]
 
-        train_questions.extend(question for question, _ in train_examples)
-        train_answers.extend(answer for _, answer in train_examples)
+        train_questions.extend(q for q, _, _ in train_examples)
+        train_answers.extend(a for _, a, _ in train_examples)
+        train_intermediates.extend(i for _, _, i in train_examples)
         train_level_ids.extend([level_idx] * len(train_examples))
 
-        eval_questions.extend(question for question, _ in eval_examples)
-        eval_answers.extend(answer for _, answer in eval_examples)
+        eval_questions.extend(q for q, _, _ in eval_examples)
+        eval_answers.extend(a for _, a, _ in eval_examples)
+        eval_intermediates.extend(i for _, _, i in eval_examples)
         eval_level_ids.extend([level_idx] * len(eval_examples))
 
     return (
         train_questions,
         train_answers,
+        train_intermediates,
         train_level_ids,
         eval_questions,
         eval_answers,
+        eval_intermediates,
         eval_level_ids,
     )
 
@@ -288,9 +318,11 @@ def _build_stratified_split():
 (
     TRAIN_PROMPT_QUESTIONS,
     TRAIN_GROUND_TRUTH,
+    TRAIN_INTERMEDIATES,
     TRAIN_LEVEL_IDS,
     EVAL_PROMPT_QUESTIONS,
     EVAL_GROUND_TRUTH,
+    EVAL_INTERMEDIATES,
     EVAL_LEVEL_IDS,
 ) = _build_stratified_split()
 

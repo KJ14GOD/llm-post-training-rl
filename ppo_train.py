@@ -9,11 +9,13 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from lora import build_lora_model, save_lora_adapters
 from data import (
     EVAL_GROUND_TRUTH,
+    EVAL_INTERMEDIATES,
     EVAL_LEVEL_COUNTS,
     EVAL_LEVEL_IDS,
     EVAL_PROMPT_QUESTIONS,
     LEVEL_NAMES,
     TRAIN_GROUND_TRUTH,
+    TRAIN_INTERMEDIATES,
     TRAIN_LEVEL_COUNTS,
     TRAIN_LEVEL_IDS,
     TRAIN_PROMPT_QUESTIONS,
@@ -21,10 +23,10 @@ from data import (
 from verifier import END_TAG, START_TAG, is_exact_format, parse_answer, reward, trim_to_final_response
 
 MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen2.5-3B-Instruct")
-MAX_NEW_TOKENS = 64
+MAX_NEW_TOKENS = 128
 SYSTEM_PROMPT = (
     "You are a precise math assistant. "
-    "You may reason briefly to solve the problem. "
+    "Solve the problem step by step, showing each operation. "
     f"Put the final answer on the last line as {START_TAG}INTEGER{END_TAG}. "
     "Do not include any text after the closing tag."
 )
@@ -237,7 +239,7 @@ def ppo_update(policy, optimizer, rollout_records, ppo_targets, device):
     }
 
 
-def collect_rollout_record(policy, reference_model, tokenizer, prompt_question, target_answer, device, do_sample=True):
+def collect_rollout_record(policy, reference_model, tokenizer, prompt_question, target_answer, device, do_sample=True, intermediate_results=None):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": prompt_question},
@@ -304,7 +306,7 @@ def collect_rollout_record(policy, reference_model, tokenizer, prompt_question, 
 
     is_exact = is_exact_format(raw_new_text)
 
-    reward_score = reward(parsed_answer, target_answer, raw_new_text, output_token_count)
+    reward_score = reward(parsed_answer, target_answer, raw_new_text, output_token_count, intermediate_results=intermediate_results)
     is_correct = parsed_answer == target_answer
 
     return RolloutRecord(
@@ -337,7 +339,7 @@ def evaluate_policy(policy, tokenizer, device, label="EVAL"):
     level_correct = [0, 0, 0]
     num_questions = len(EVAL_PROMPT_QUESTIONS)
 
-    for i, (prompt_question, target_answer) in enumerate(zip(EVAL_PROMPT_QUESTIONS, EVAL_GROUND_TRUTH)):
+    for i, (prompt_question, target_answer, intermediates) in enumerate(zip(EVAL_PROMPT_QUESTIONS, EVAL_GROUND_TRUTH, EVAL_INTERMEDIATES)):
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt_question},
@@ -368,7 +370,7 @@ def evaluate_policy(policy, tokenizer, device, label="EVAL"):
         if is_exact:
             exact_format_count += 1
 
-        reward_score = reward(parsed_answer, target_answer, raw_new_text, new_token_count)
+        reward_score = reward(parsed_answer, target_answer, raw_new_text, new_token_count, intermediate_results=intermediates)
         total_reward += reward_score
 
         is_correct = parsed_answer == target_answer
@@ -409,7 +411,7 @@ def train_ppo_epoch(policy, reference_model, tokenizer, optimizer, device, epoch
     num_correct = 0
     total_reward = 0.0
 
-    for i, (prompt_question, target_answer) in enumerate(zip(TRAIN_PROMPT_QUESTIONS, TRAIN_GROUND_TRUTH)):
+    for i, (prompt_question, target_answer, intermediates) in enumerate(zip(TRAIN_PROMPT_QUESTIONS, TRAIN_GROUND_TRUTH, TRAIN_INTERMEDIATES)):
         rollout = collect_rollout_record(
             policy=policy,
             reference_model=reference_model,
@@ -418,6 +420,7 @@ def train_ppo_epoch(policy, reference_model, tokenizer, optimizer, device, epoch
             target_answer=target_answer,
             device=device,
             do_sample=True,
+            intermediate_results=intermediates,
         )
         targets = build_ppo_targets(rollout)
         rollout_records.append(rollout)
