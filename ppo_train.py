@@ -27,7 +27,8 @@ MAX_NEW_TOKENS = 128
 SYSTEM_PROMPT = (
     "You are a precise math assistant. "
     "Solve the problem step by step, showing each operation. "
-    f"Put the final answer on the last line as {START_TAG}INTEGER{END_TAG}. "
+    "After your reasoning, write the final answer on its own line in this exact format:\n"
+    f"{START_TAG}INTEGER{END_TAG}\n"
     "Do not include any text after the closing tag."
 )
 
@@ -430,8 +431,10 @@ def train_ppo_epoch(policy, reference_model, tokenizer, optimizer, device, epoch
             num_correct += 1
         total_reward += rollout.reward_score
 
-        status = "CORRECT" if rollout.is_correct else "INCORRECT"
-        print(f"    [{status}] Q: {prompt_question[:60]}  A: {repr(rollout.final_text)[:40]}  parsed={rollout.parsed_answer}  truth={target_answer}  reward={rollout.reward_score}")
+        if not rollout.is_correct:
+            print(f"    [INCORRECT] Q: {prompt_question}")
+            print(f"      Full output: {repr(rollout.final_text)}")
+            print(f"      Parsed: {rollout.parsed_answer}  Truth: {target_answer}  Reward: {rollout.reward_score}")
 
     num_questions = len(TRAIN_PROMPT_QUESTIONS)
     print(f"  Epoch {epoch + 1} rollouts: {num_correct}/{num_questions} correct, avg reward {total_reward / num_questions:.4f}")
@@ -505,22 +508,46 @@ def main():
                 save_lora_adapters(policy.policy_model, BEST_ADAPTER_SAVE_PATH)
                 print(f"  New best reward: {best_reward:.4f} — saved to {BEST_ADAPTER_SAVE_PATH}")
 
-    # post-training evaluation
-    print("Post-training evaluation...")
-    post_metrics = evaluate_policy(policy, tokenizer, device, label="POST-TRAINING")
+    # save latest adapters
+    save_lora_adapters(policy.policy_model, ADAPTER_SAVE_PATH)
+
+    # post-training evaluation (latest checkpoint)
+    print("Post-training evaluation (LATEST)...")
+    latest_metrics = evaluate_policy(policy, tokenizer, device, label="POST-TRAINING (LATEST)")
+
+    # post-training evaluation (best checkpoint)
+    best_metrics = None
+    if os.path.exists(BEST_ADAPTER_SAVE_PATH):
+        print("Loading best checkpoint for evaluation...")
+        from lora import load_lora_adapters
+        best_lora_model = load_lora_adapters(MODEL_ID, BEST_ADAPTER_SAVE_PATH, dtype)
+        best_policy = PolicyWithValueHead(best_lora_model).to(device)
+        best_policy.eval()
+        best_metrics = evaluate_policy(best_policy, tokenizer, device, label="POST-TRAINING (BEST)")
+        del best_policy, best_lora_model
 
     # comparison
-    print("=" * 40)
-    print("  BEFORE vs AFTER")
-    print("=" * 40)
-    print(f"  Accuracy:     {pre_metrics['accuracy']:.1%} -> {post_metrics['accuracy']:.1%}")
-    print(f"  Exact format: {pre_metrics['exact_format_rate']:.1%} -> {post_metrics['exact_format_rate']:.1%}")
-    print(f"  Avg reward:   {pre_metrics['avg_reward']:.4f} -> {post_metrics['avg_reward']:.4f}")
-    print(f"  Avg length:   {pre_metrics['avg_output_len']:.1f} -> {post_metrics['avg_output_len']:.1f}")
-    print("=" * 40)
-
-    # save trained adapters
-    save_lora_adapters(policy.policy_model, ADAPTER_SAVE_PATH)
+    print("=" * 50)
+    print("  BASELINE vs LATEST vs BEST")
+    print("=" * 50)
+    header = f"  {'':20s} {'Baseline':>10s}  {'Latest':>10s}"
+    acc_line = f"  {'Accuracy':20s} {pre_metrics['accuracy']:>10.1%}  {latest_metrics['accuracy']:>10.1%}"
+    fmt_line = f"  {'Exact format':20s} {pre_metrics['exact_format_rate']:>10.1%}  {latest_metrics['exact_format_rate']:>10.1%}"
+    rew_line = f"  {'Avg reward':20s} {pre_metrics['avg_reward']:>10.4f}  {latest_metrics['avg_reward']:>10.4f}"
+    len_line = f"  {'Avg length':20s} {pre_metrics['avg_output_len']:>10.1f}  {latest_metrics['avg_output_len']:>10.1f}"
+    if best_metrics:
+        header += f"  {'Best':>10s}"
+        acc_line += f"  {best_metrics['accuracy']:>10.1%}"
+        fmt_line += f"  {best_metrics['exact_format_rate']:>10.1%}"
+        rew_line += f"  {best_metrics['avg_reward']:>10.4f}"
+        len_line += f"  {best_metrics['avg_output_len']:>10.1f}"
+    print(header)
+    print(f"  {'─' * (len(header) - 2)}")
+    print(acc_line)
+    print(fmt_line)
+    print(rew_line)
+    print(len_line)
+    print("=" * 50)
 
 
 if __name__ == "__main__":

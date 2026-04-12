@@ -15,8 +15,9 @@ MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen2.5-3B-Instruct")
 MAX_NEW_TOKENS = 64
 SYSTEM_PROMPT = (
     "You are a precise math assistant. "
-    "You may reason briefly to solve the problem. "
-    f"Put the final answer on the last line as {START_TAG}INTEGER{END_TAG}. "
+    "Solve the problem step by step, showing each operation. "
+    "After your reasoning, write the final answer on its own line in this exact format:\n"
+    f"{START_TAG}INTEGER{END_TAG}\n"
     "Do not include any text after the closing tag."
 )
 
