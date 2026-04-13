@@ -23,7 +23,7 @@ from data import (
 from verifier import END_TAG, START_TAG, is_exact_format, parse_answer, reward, trim_to_final_response
 
 MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen2.5-3B-Instruct")
-MAX_NEW_TOKENS = 128
+MAX_NEW_TOKENS = 64
 SYSTEM_PROMPT = (
     "You are a precise math assistant. "
     "Solve the problem step by step, showing each operation. "
@@ -431,10 +431,8 @@ def train_ppo_epoch(policy, reference_model, tokenizer, optimizer, device, epoch
             num_correct += 1
         total_reward += rollout.reward_score
 
-        if not rollout.is_correct:
-            print(f"    [INCORRECT] Q: {prompt_question}")
-            print(f"      Full output: {repr(rollout.final_text)}")
-            print(f"      Parsed: {rollout.parsed_answer}  Truth: {target_answer}  Reward: {rollout.reward_score}")
+        status = "CORRECT" if rollout.is_correct else "INCORRECT"
+        print(f"    [{status}] Q: {prompt_question[:60]}  A: {repr(rollout.final_text)[:40]}  parsed={rollout.parsed_answer}  truth={target_answer}  reward={rollout.reward_score}")
 
     num_questions = len(TRAIN_PROMPT_QUESTIONS)
     print(f"  Epoch {epoch + 1} rollouts: {num_correct}/{num_questions} correct, avg reward {total_reward / num_questions:.4f}")
